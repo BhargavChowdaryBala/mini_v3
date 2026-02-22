@@ -1,0 +1,30 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.pytest_cache/
+
+# Node.js
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Models (Large files)
+backend/*.pt
+backend/*.onnx
+
+# Local artifacts
+.gemini/
+brain/

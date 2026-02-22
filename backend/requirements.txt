@@ -1,0 +1,10 @@
+flask
+flask-cors
+opencv-python
+ultralytics
+paddleocr
+paddlepaddle
+pymongo
+numpy
+python-dotenv
+gunicorn
