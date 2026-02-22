@@ -7,6 +7,8 @@ import time
 
 import os
 
+import gc
+
 class BusProcessor:
     def __init__(self, bus_model_path=None, plate_model_path=None, line_y=400):
         # Resolve paths relative to this file
@@ -17,19 +19,27 @@ class BusProcessor:
         if plate_model_path is None:
             plate_model_path = os.path.join(base_path, 'best.pt')
             
+        # Virtual line position (y-coordinate)
+        self.line_y = line_y
+        
         # Load models
         print("Loading Bus Model...")
         self.bus_model = YOLO(bus_model_path)
+        self.bus_model.to('cpu') # Explicitly use CPU
+        gc.collect() # Free memory
+        
         print("Bus Model Loaded.")
         print("Loading Plate Model...")
         self.plate_model = YOLO(plate_model_path)
+        self.plate_model.to('cpu')
+        gc.collect()
+        
         print("Plate Model Loaded.")
         print("Initializing PaddleOCR...")
-        self.ocr = PaddleOCR(use_angle_cls=True, lang='en')
+        # use_angle_cls=False saves significant memory
+        self.ocr = PaddleOCR(use_angle_cls=False, lang='en', use_gpu=False, show_log=False)
+        gc.collect()
         print("PaddleOCR Initialized.")
-        
-        # Virtual line position (y-coordinate)
-        self.line_y = line_y
         
         # Tracking and event locking
         self.processed_ids = set()
