@@ -25,6 +25,10 @@ Thumbs.db
 backend/*.pt
 backend/*.onnx
 
+# Explicitly allow required models
+!backend/best.pt
+!backend/yolov8n.pt
+
 # Local artifacts
 .gemini/
 brain/

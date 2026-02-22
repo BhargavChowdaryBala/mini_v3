@@ -5,8 +5,18 @@ from paddleocr import PaddleOCR
 from database import log_event
 import time
 
+import os
+
 class BusProcessor:
-    def __init__(self, bus_model_path='yolov8n.pt', plate_model_path='best.pt', line_y=400):
+    def __init__(self, bus_model_path=None, plate_model_path=None, line_y=400):
+        # Resolve paths relative to this file
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        
+        if bus_model_path is None:
+            bus_model_path = os.path.join(base_path, 'yolov8n.pt')
+        if plate_model_path is None:
+            plate_model_path = os.path.join(base_path, 'best.pt')
+            
         # Load models
         print("Loading Bus Model...")
         self.bus_model = YOLO(bus_model_path)
