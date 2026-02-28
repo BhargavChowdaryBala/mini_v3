@@ -2,9 +2,14 @@ flask
 flask-cors
 opencv-python-headless
 ultralytics
-paddleocr
-paddlepaddle
+paddleocr<3.0.0
+paddlepaddle==2.6.2
 pymongo
 numpy
 python-dotenv
 gunicorn
+matplotlib
+streamlit
+shapely
+streamlit-lottie
+requests

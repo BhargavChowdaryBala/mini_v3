@@ -40,6 +40,10 @@ This guide explains how to deploy your application to **Render** (Backend) and *
 4. Add **Environment Variables**:
    - `MONGO_URI`: Your MongoDB Atlas connection string.
    - `PORT`: 10000 (usually set automatically by Render).
+   - `MALLOC_ARENA_MAX`: `2` (Highly recommended for 512MB RAM).
+
+> [!TIP]
+> **Video Uploads**: Render has a temporary file system. Uploaded videos will work but will be cleaned up automatically by the system and my built-in cleanup logic.
 
 ---
 

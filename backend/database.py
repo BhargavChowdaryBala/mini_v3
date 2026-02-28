@@ -10,41 +10,97 @@ DB_NAME = "bus_monitoring"
 COLLECTION_NAME = "logs"
 
 # Connect with a timeout to avoid hangs
-client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-db = client[DB_NAME]
-logs_collection = db[COLLECTION_NAME]
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+    # Trigger a quick check
+    client.admin.command('ping')
+    db = client[DB_NAME]
+    logs_collection = db[COLLECTION_NAME]
+    DB_CONNECTED = True
+    print("Successfully connected to MongoDB.")
+except Exception as e:
+    print(f"Warning: Database connection failed: {e}")
+    DB_CONNECTED = False
+    # Mock storage for session-only logs if DB fails
+    MOCK_LOGS = []
 
 def check_db():
-    try:
-        client.admin.command('ping')
-        return True
-    except Exception as e:
-        print(f"Database connection failed: {e}")
-        return False
+    return DB_CONNECTED
 
-def log_event(registration_number, status):
+def log_event(registration_number, status, source="live", bus_id=None):
     """
-    Logs an entry/exit event to the database.
+    Logs an entry/exit event to the database. Unique per (bus_id, source).
     """
+    now = datetime.now()
     log_entry = {
         "registration_number": registration_number,
         "status": status,
-        "timestamp": datetime.now()
+        "timestamp": now,
+        "source": source,
+        "bus_id": bus_id
     }
-    try:
-        result = logs_collection.insert_one(log_entry)
-        print(f"Logged event: {registration_number} - {status} (ID: {result.inserted_id})")
+    
+    if DB_CONNECTED:
+        try:
+            # Use bus_id and source as the unique identifier for a detection event
+            # to allow multiple buses with 'No Plate' or the same plate (unlikely but possible)
+            filter_query = {"source": source}
+            if bus_id is not None:
+                filter_query["bus_id"] = bus_id
+            else:
+                filter_query["registration_number"] = registration_number
+
+            result = logs_collection.update_one(
+                filter_query,
+                {"$set": log_entry},
+                upsert=True
+            )
+            
+            identifier = bus_id if bus_id else registration_number
+            if result.upserted_id:
+                print(f"Logged NEW {source} event (ID:{identifier}): {registration_number} - {status}")
+            else:
+                print(f"Updated EXISTING {source} event (ID:{identifier}): {registration_number} - {status}")
+            return True
+        except Exception as e:
+            print(f"Error logging to database: {e}")
+            return False
+    else:
+        # Fallback to in-memory logs with unique check per source
+        existing_idx = next((i for i, log in enumerate(MOCK_LOGS) 
+                             if log["registration_number"] == registration_number and log["source"] == source), None)
+        if existing_idx is not None:
+            MOCK_LOGS[existing_idx]["timestamp"] = now
+            MOCK_LOGS[existing_idx]["status"] = status
+            print(f"Updated EXISTING {source} event (MEMORY): {registration_number} - {status}")
+        else:
+            log_entry["_id"] = f"mock_{len(MOCK_LOGS)}"
+            MOCK_LOGS.insert(0, log_entry)
+            print(f"Logged NEW {source} event (MEMORY): {registration_number} - {status}")
+        
+        if len(MOCK_LOGS) > 200: MOCK_LOGS.pop()
         return True
-    except Exception as e:
-        print(f"Error logging to database: {e}")
-        return False
 
 def get_recent_logs(limit=20):
     """
-    Retrieves recent logs for the dashboard.
+    Retrieves recent logs for the dashboard from DB or memory.
     """
-    logs = list(logs_collection.find().sort("timestamp", -1).limit(limit))
-    for log in logs:
-        log["_id"] = str(log["_id"])
-        log["timestamp"] = log["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
-    return logs
+    if DB_CONNECTED:
+        try:
+            logs = list(logs_collection.find().sort("timestamp", -1).limit(limit))
+            for log in logs:
+                log["_id"] = str(log["_id"])
+                log["timestamp"] = log["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+            return logs
+        except Exception as e:
+            print(f"DB Fetch Error: {e}")
+            return []
+    else:
+        # Return mock logs with formatted timestamp
+        formatted_logs = []
+        for log in MOCK_LOGS[:limit]:
+            entry = log.copy()
+            if isinstance(entry["timestamp"], datetime):
+                entry["timestamp"] = entry["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+            formatted_logs.append(entry)
+        return formatted_logs

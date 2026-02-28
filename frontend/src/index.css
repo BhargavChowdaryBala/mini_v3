@@ -29,3 +29,59 @@ body {
 #root {
     width: 100%;
 }
+
+/* WIP Container Styles */
+.wip-container {
+    width: 100%;
+    aspect-ratio: 16/9;
+    background: rgba(0, 0, 0, 0.4);
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--glass-border);
+    margin-top: 20px;
+}
+
+.wip-content {
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 15px;
+    padding: 40px;
+}
+
+.wip-content h2 {
+    font-size: 2rem;
+    color: var(--text-primary);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+}
+
+.wip-content p {
+    color: var(--text-secondary);
+}
+
+.wip-hint {
+    background: rgba(10, 10, 12, 0.8);
+    padding: 8px 16px;
+    border-radius: 20px;
+    border: 1px solid var(--neon-blue);
+    font-size: 0.8rem;
+    color: var(--neon-blue);
+    margin-top: 10px;
+}
+
+/* Table Enhancements */
+.bus-id-text {
+    font-family: 'Inter', monospace;
+    color: var(--neon-blue);
+    font-weight: 600;
+}
+
+.warning-text {
+    color: #ff4d4d !important;
+    font-style: italic;
+    font-size: 0.9rem;
+}
