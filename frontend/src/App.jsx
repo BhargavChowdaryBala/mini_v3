@@ -56,8 +56,10 @@ function App() {
 
         const fetchData = async () => {
             try {
+                // Determine source filter based on appMode
+                const sourceQuery = appMode === 'upload' ? 'upload' : 'live';
                 const [logsRes, statusRes] = await Promise.all([
-                    axios.get(`${API_BASE}/api/logs`),
+                    axios.get(`${API_BASE}/api/logs?source=${sourceQuery}`),
                     axios.get(`${API_BASE}/api/status`)
                 ]);
                 setLogs(logsRes.data);
@@ -74,7 +76,7 @@ function App() {
         fetchData();
         const interval = setInterval(fetchData, 3000); // Relaxed interval
         return () => clearInterval(interval);
-    }, [useMobileCamera]);
+    }, [useMobileCamera, appMode]);
 
     // Mobile Camera logic
     useEffect(() => {
@@ -204,10 +206,15 @@ function App() {
                 try {
                     const [statusRes, logsRes] = await Promise.all([
                         axios.get(`${API_BASE}/api/upload_status`),
-                        axios.get(`${API_BASE}/api/logs`)
+                        axios.get(`${API_BASE}/api/logs?source=upload`)
                     ]);
 
                     setVProgress(statusRes.data.progress);
+
+                    // Update global logs state with the latest upload logs
+                    setLogs(logsRes.data);
+
+                    // Count plates specifically for the current viewing context
                     const currentLogs = logsRes.data.filter(l => l.source && l.source.includes('upload'));
                     setVPlatesDetected(currentLogs.length);
 

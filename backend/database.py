@@ -32,6 +32,13 @@ def log_event(registration_number, status, source="live", bus_id=None):
     Logs an entry/exit event to the database. Unique per (bus_id, source).
     """
     now = datetime.now()
+    # Cast bus_id to standard python int if it's a numpy type (prevents MongoDB serialization error)
+    if bus_id is not None:
+        try:
+            bus_id = int(bus_id)
+        except:
+            pass
+
     log_entry = {
         "registration_number": registration_number,
         "status": status,
@@ -81,13 +88,19 @@ def log_event(registration_number, status, source="live", bus_id=None):
         if len(MOCK_LOGS) > 200: MOCK_LOGS.pop()
         return True
 
-def get_recent_logs(limit=20):
+def get_recent_logs(limit=20, source=None):
     """
     Retrieves recent logs for the dashboard from DB or memory.
+    Supports filtering by source prefix (e.g., 'upload' or 'live').
     """
     if DB_CONNECTED:
         try:
-            logs = list(logs_collection.find().sort("timestamp", -1).limit(limit))
+            query = {}
+            if source:
+                # Case-insensitive prefix match for source
+                query["source"] = {"$regex": f"^{source}", "$options": "i"}
+            
+            logs = list(logs_collection.find(query).sort("timestamp", -1).limit(limit))
             for log in logs:
                 log["_id"] = str(log["_id"])
                 log["timestamp"] = log["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
@@ -96,9 +109,14 @@ def get_recent_logs(limit=20):
             print(f"DB Fetch Error: {e}")
             return []
     else:
+        # Return mock logs with optional source filtering
+        filtered_logs = MOCK_LOGS
+        if source:
+            filtered_logs = [log for log in MOCK_LOGS if log.get("source", "").lower().startswith(source.lower())]
+            
         # Return mock logs with formatted timestamp
         formatted_logs = []
-        for log in MOCK_LOGS[:limit]:
+        for log in filtered_logs[:limit]:
             entry = log.copy()
             if isinstance(entry["timestamp"], datetime):
                 entry["timestamp"] = entry["timestamp"].strftime("%Y-%m-%d %H:%M:%S")

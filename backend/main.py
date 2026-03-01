@@ -17,7 +17,7 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import cv2
 import torch
-from processor import BusProcessor, VideoUploadProcessor, apply_clahe, extract_indian_number_plate
+from processor import BusProcessor, VideoUploadProcessor, apply_professional_restoration, extract_indian_number_plate
 from database import get_recent_logs
 import threading
 import time
@@ -168,64 +168,11 @@ def upload_video_feed():
 # Live webcam and RTSP capture code are disabled per user requirements.
 # The system now uses a file-based pipeline for higher reliability and proximity-based OCR.
 
-# class CameraThread(threading.Thread):
-#     ... (original camera thread commented out for future reference)
-
-class VideoFileThread(threading.Thread):
-    """
-    New Video File Pipeline: Processes a local video file frame-by-frame.
-    """
-    def __init__(self, video_path="bus.mp4"):
-        super().__init__()
-        self.daemon = True
-        self.running = True
-        self.video_path = video_path
-
-    def run(self):
-        global last_frame
-        
-        # Check if file exists in root or backend/
-        if not os.path.exists(self.video_path):
-            alt_path = os.path.join("..", self.video_path)
-            if os.path.exists(alt_path):
-                self.video_path = alt_path
-            else:
-                print(f"CRITICAL ERROR: Video file {self.video_path} not found.")
-                processor.system_status = "Error: Video not found"
-                return
-
-        while self.running:
-            print(f"Initializing Video File Pipeline: {self.video_path}")
-            cap = cv2.VideoCapture(self.video_path)
-            
-            if not cap.isOpened():
-                print(f"Error: Could not open video file {self.video_path}")
-                time.sleep(5)
-                continue
-
-            while self.running:
-                success, frame = cap.read()
-                if not success:
-                    print("Video File Processed Completely. Looping...")
-                    break
-                
-                # Process frame through proximity-based pipeline
-                processed_frame = processor.process_frame(frame)
-                
-                with lock:
-                    last_frame = processed_frame
-                
-                # Small delay to keep UI consistent and CPU sane
-                time.sleep(0.01)
-            
-            cap.release()
-            # Reset processor state for next loop to re-process bus IDs if needed
-            processor.reset()
-            time.sleep(2)
-
-# Start Video File Pipeline
-pipeline_thread = VideoFileThread("bus.mp4")
-pipeline_thread.start()
+# ==========================================
+# VIDEO PIPELINE INITIALIZATION
+# ==========================================
+# The system now uses a manual upload-and-analyze approach.
+# Automatic processing on startup is disabled.
 
 def generate_frames():
     global last_frame
@@ -255,7 +202,8 @@ def video_feed():
 @app.route('/api/logs')
 def logs():
     try:
-        data = get_recent_logs()
+        source = request.args.get('source')
+        data = get_recent_logs(source=source)
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -306,8 +254,8 @@ def check_image():
                 if plate_crop.size == 0:
                     return jsonify({"plate_text": "NOT DETECTED", "confidence": 0, "plate_image": None, "metrics": {"yolo": round(yolo_time, 2), "ocr": 0}})
 
-                # Apply CLAHE Preprocessing
-                plate_crop_enhanced = apply_clahe(plate_crop)
+                # Apply Professional ISP Preprocessing
+                plate_crop_enhanced = apply_professional_restoration(plate_crop)
                 
                 _, buffer = cv2.imencode('.jpg', plate_crop_enhanced)
                 plate_img_b64 = base64.b64encode(buffer).decode('utf-8')
