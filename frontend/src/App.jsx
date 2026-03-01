@@ -496,7 +496,7 @@ function App() {
                                                                 transition={{ delay: index * 0.05 }}
                                                             >
                                                                 <td className="bus-id-text">#{log.bus_id || 'N/A'}</td>
-                                                                <td className={`plate-text ${(log.registration_number || '').includes('No Number Plate') ? 'warning-text' : ''}`}>
+                                                                <td className={`plate-text ${(log.registration_number || '').includes('missed') ? 'warning-text' : ''}`}>
                                                                     {log.registration_number}
                                                                 </td>
                                                                 <td>

@@ -49,42 +49,58 @@ def deskew_plate(image):
     rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     return rotated
 
+def apply_morphology(image):
+    """Bridge character gaps using morphological closing."""
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    return cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel)
+
 def apply_professional_restoration(image):
     """
-    Professional Image Signal Processing (ISP) pipeline for ANPR.
-    1. NLMeans Denoising
-    2. Bicubic Upscaling (if small)
-    3. Unsharp Masking (Sharpening)
-    4. Adaptive Normalization
+    Elite Image Signal Processing (ISP) pipeline for ANPR.
+    Returns 3 versions for Multi-Pass OCR.
     """
     if image is None or image.size == 0:
-        return image
+        return [image]
     
-    # 1. Bicubic Upscaling (Super-Resolution Lite)
-    # Upscale smaller crops to 2x or 3x for more pixels per character
+    # 1. Bicubic Super-Resolution (Upscale to target 150px height)
     h, w = image.shape[:2]
-    if w < 160:
-        scale = 2.0
-        image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+    scale = 200 / h if h < 200 else 1.0
+    upscaled = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
     
-    # 2. Fast Non-Local Means Denoising (Professional standard)
-    # Removes CCD sensor noise while preserving details
-    denoised = cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
+    # 2. NLMeans Denoising (Preserves edges while removing digital artifacts)
+    denoised = cv2.fastNlMeansDenoisingColored(upscaled, None, 10, 10, 7, 21)
     
     # 3. CLAHE (Local Contrast Enhancement)
-    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2Lab)
+    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    limg = cv2.merge((cl, a, b))
-    enhanced = cv2.cvtColor(limg, cv2.COLOR_Lab2BGR)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     
     # 4. Unsharp Masking (Sharpening)
-    # Enhance edges by subtracting a Gaussian-blurred version
     gaussian_blur = cv2.GaussianBlur(enhanced, (0, 0), 2.0)
     sharpened = cv2.addWeighted(enhanced, 1.5, gaussian_blur, -0.5, 0)
     
-    return sharpened
+    # Conversion to Grayscale for final passes
+    gray = cv2.cvtColor(sharpened, cv2.COLOR_BGR2GRAY)
+    
+    # Pass A: Normalized Grayscale
+    pass_a = gray.copy()
+    
+    # Pass B: Otsu Binarization + Morphology
+    _, pass_b = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Auto-Invert if needed
+    if cv2.countNonZero(pass_b) < (pass_b.shape[0] * pass_b.shape[1] * 0.5):
+        pass_b = cv2.bitwise_not(pass_b)
+    pass_b = apply_morphology(pass_b)
+    
+    # Pass C: Adaptive Thresholding
+    pass_c = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 5)
+    if cv2.countNonZero(pass_c) < (pass_c.shape[0] * pass_c.shape[1] * 0.5):
+        pass_c = cv2.bitwise_not(pass_c)
+
+    return [pass_a, pass_b, pass_c]
 
 def character_voting(plate_results):
     """
@@ -122,29 +138,61 @@ def character_voting(plate_results):
     return final_plate
 
 def extract_indian_number_plate(text_list):
-    """Standardized Indian Number Plate extraction logic with multi-stage fallback."""
+    """
+    Standardized Indian Number Plate extraction logic.
+    Prioritizes 10-character Indian format: [LL][NN][LL][NNNN]
+    - LL: State Code (e.g. AP)
+    - NN: District Code (e.g. 39)
+    - LL: Serial Code (e.g. UX)
+    - NNNN: Unique Number (e.g. 8273)
+    """
     text = " ".join(text_list).upper()
     # Remove common OCR noise
     text = re.sub(r'\bIND\b|\bND\b|\s+', '', text)
     # Remove all non-alphanumeric chars
     text = re.sub(r'[^A-Z0-9]', '', text)
-    # Safe OCR corrections (common confusions)
-    # text = text.replace('O', '0').replace('I', '1') # Keep commented or use sparingly
+    # Safe OCR corrections (most common mistakes)
+    # Be careful not to replace every O/0 if it's at the start of a serial etc,
+    # but for most Indian plates, this helps significantly.
+    text = text.replace('O', '0').replace('I', '1').replace('Z', '2').replace('S', '5')
 
-    # ✅ Bharat Series: YYBHXXXX + optional letters (e.g., 22BH1234AA)
-    match = re.search(r'\d{2}BH\d{4}[A-Z]{0,2}', text)
+    # [STRICT 10-CHAR] ✅ Standard Modern (e.g., AP39UX8273)
+    # Pattern: [2 Letters][2 Numbers][2 Letters][4 Numbers]
+    match = re.search(r'[A-Z]{2}\d{2}[A-Z]{2}\d{4}', text)
     if match: return match.group()
 
-    # ✅ More permissive Indian plates (e.g., TS09EA1234 or TS9EA1234)
-    match = re.search(r'[A-Z]{1,2}\d{1,2}[A-Z]{1,2}\d{4}', text)
-    if match: return match.group()
-
-    # ✅ Very General Alphanumeric fallback (min 5 chars)
-    match = re.search(r'[A-Z0-9]{5,12}', text)
+    # [STRICT 10-CHAR-B] ✅ (e.g., AP39 0442 -> maybe missed serial, but if 10 is the rule)
+    # If the user says it has 10, but detection is flaky:
+    match = re.search(r'[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}', text)
     if match: 
         candidate = match.group()
-        # Heuristic: must contain at least 2 digits to be a plausible plate
-        if sum(c.isdigit() for c in candidate) >= 2:
+        if len(candidate) == 10: return candidate
+
+    # ✅ Bharat Series (e.g., 22BH1234AA) - 10 chars
+    match = re.search(r'\d{2}BH\d{4}[A-Z]{2}', text)
+    if match: return match.group()
+
+    # ✅ Standard Modern 9-character fallback (e.g. KA01M1234)
+    match = re.search(r'[A-Z]{2}\d{2}[A-Z]{1}\d{4}', text)
+    if match: return match.group()
+
+    # ✅ Older Format / 2-digit serial / Govt (e.g., DL3CA6341)
+    match = re.search(r'[A-Z]{2}\d{1,2}[A-Z]?\d{4}', text)
+    if match: return match.group()
+    
+    # ✅ Very General Alphanumeric fallback (strictly 10 chars if possible)
+    # If we have a 10 char string that looks like a plate
+    match = re.search(r'[A-Z0-9]{10}', text)
+    if match: return match.group()
+
+    # Final Catch-all (5-12 chars)
+    match = re.search(r'[A-Z0-9]{5,12}', text)
+    if match:
+        candidate = match.group()
+        # Custom logic for "COLLEGEBUS" and similar detections
+        if len(candidate) > 7 and candidate.isalpha():
+            return candidate
+        if sum(c.isdigit() for c in candidate) >= 2 and sum(c.isalpha() for c in candidate) >= 2:
             return candidate
 
     return "UNKNOWN"
@@ -156,7 +204,6 @@ class BusProcessor:
         - line_position: 0.0 to 1.0 (percent of width/height)
         - line_direction: 'vertical' (for left-right) or 'horizontal' (for top-bottom)
         """
-        # Resolve paths relative to this file
         base_path = os.path.dirname(os.path.abspath(__file__))
         
         if bus_model_path is None:
@@ -298,7 +345,7 @@ class BusProcessor:
                                 
                                 print(f"[AI] >>> ANALYSIS TRIGGERED for Bus {track_id}")
                                 thread = threading.Thread(target=self._background_burst_analysis, 
-                                                         args=(state["frames"], "UNKNOWN", track_id))
+                                                         args=(state["frames"], "DETECTED", track_id))
                                 thread.daemon = True
                                 thread.start()
 
@@ -309,7 +356,7 @@ class BusProcessor:
 
     def _background_burst_analysis(self, burst_frames, direction, track_id):
         """
-        Processes exactly 12 captured frames with intelligence:
+        Processes captured frames with intelligence:
         1. Localize plate in ALL frames.
         2. Sort by sharpness and pick the top 8 clearest crops.
         3. Perform deskewing and bilateral filtering.
@@ -341,37 +388,51 @@ class BusProcessor:
             self.run_multi_ocr(deskewed_crops, direction, track_id)
         else:
             print(f"[AI] No plate localized in burst for Bus {track_id}.")
-            log_event("numberplate missed", direction, source=self.current_session, bus_id=track_id)
+            log_event("numberplate missed", "DETECTED", source=self.current_session, bus_id=track_id)
 
     def run_multi_ocr(self, plate_images, direction, track_id):
         if self.ocr is None: return
 
         results = [] # Store (text, confidence)
+        # [Smart Multi-Pass] Step 1: Fast Grayscale Pass on all frames
         for img in plate_images:
-            if img is None or img.size == 0: continue
+            # We already have deskewed crops here
+            h, w = img.shape[:2]
+            scale = 200 / h if h < 200 else 1.0
+            prepped = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+            prepped = cv2.fastNlMeansDenoisingColored(prepped, None, 10, 10, 7, 21)
             
-            # Use PROFESSIONAL ISP PIPELINE
-            processed_img = apply_professional_restoration(img)
-            
+            gray = cv2.cvtColor(prepped, cv2.COLOR_BGR2GRAY)
             try:
                 with self.lock:
-                    result = self.ocr.ocr(processed_img, cls=True)
-                
+                    result = self.ocr.ocr(gray, cls=True)
                 if result and result[0]:
-                    # Combined line text
-                    raw_text = "".join([line[1][0] for idx in range(len(result)) for line in result[idx]])
-                    # Calculate average confidence for the detection
-                    conf_scores = [line[1][1] for idx in range(len(result)) for line in result[idx]]
-                    avg_conf = sum(conf_scores) / len(conf_scores) if conf_scores else 0
-                    
-                    # Store for voting
-                    clean_text = re.sub(r'[^A-Z0-9]', '', raw_text.upper())
-                    if len(clean_text) >= 4:
-                        results.append((clean_text, avg_conf))
-            except Exception as e:
-                print(f"OCR Error: {e}")
-        
-        # Weighted character voting
+                    lines = [line[1] for idx in range(len(result)) for line in result[idx]]
+                    raw_text = "".join([l[0] for l in lines])
+                    conf = sum([l[1] for l in lines]) / len(lines) if lines else 0
+                    clean = re.sub(r'[^A-Z0-9]', '', raw_text.upper())
+                    if len(clean) >= 4: results.append((clean, conf))
+            except: pass
+
+        # Step 2: Fallback to Heavy Passes only if needed
+        if not results or max([r[1] for r in results]) < 0.6:
+            # Pick the top 5 frames for heavy processing
+            for img in plate_images[-5:]:
+                versions = apply_professional_restoration(img)
+                # apply_professional_restoration returns [pass_a, pass_b, pass_c]
+                # Pass B (Otsu) and Pass C (Adaptive) are the "heavy" ones
+                for processed_img in versions[1:]: 
+                    try:
+                        with self.lock:
+                            result = self.ocr.ocr(processed_img, cls=True)
+                        if result and result[0]:
+                            lines = [line[1] for idx in range(len(result)) for line in result[idx]]
+                            raw_text = "".join([l[0] for l in lines])
+                            conf = sum([l[1] for l in lines]) / len(lines) if lines else 0
+                            clean = re.sub(r'[^A-Z0-9]', '', raw_text.upper())
+                            if len(clean) >= 4: results.append((clean, conf))
+                    except: pass
+
         final_plate_raw = character_voting(results)
         
         # Apply extraction regex
@@ -383,15 +444,15 @@ class BusProcessor:
             if best_single[1] > 0.6: # If confidence > 60%
                 final_plate = extract_indian_number_plate([best_single[0]])
         
-        if final_plate != "UNKNOWN":
-            log_event(final_plate, direction, source=self.current_session, bus_id=track_id)
+        if final_plate != 'UNKNOWN':
+            log_event(final_plate, 'DETECTED', source=self.current_session, bus_id=track_id)
         else:
             # If all 5 frames failed to produce a valid OCR result
-            log_event("numberplate missed", direction, source=self.current_session, bus_id=track_id)
+            log_event('numberplate missed', 'DETECTED', source=self.current_session, bus_id=track_id)
 
     def run_ocr(self, plate_img, direction):
         """Legacy support for single plate processing."""
-        self.run_multi_ocr([plate_img], direction)
+        self.run_multi_ocr([plate_img], 'DETECTED')
 
     def get_status(self):
         return self.system_status

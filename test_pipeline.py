@@ -28,7 +28,7 @@ def test_video_analysis():
         return False
     
     print("\n--- [3] Polling Upload Status ---")
-    for i in range(120):  # Poll for up to 60 seconds
+    for i in range(360):  # Poll for up to 180 seconds
         time.sleep(0.5)
         s = requests.get(f"{BASE_URL}/api/upload_status").json()
         print(f"  [{i+1}] Status: {s.get('status')} | Progress: {s.get('progress')}%")

@@ -33,7 +33,9 @@ CORS(app)
 def health():
     return jsonify({"status": "healthy", "timestamp": time.time()})
 
-VIDEO_SOURCE = 0 
+# For demo purposes, we use bus.mp4 as the "Live" source. 
+# Set to 0 for real webcam.
+VIDEO_SOURCE = "bus.mp4" 
 
 # Initialize processors (Isolated)
 # Line config for Live/File Pipeline (Adjusted for bus.mp4)
@@ -52,12 +54,11 @@ print("Processors Ready.")
 last_frame = None
 lock = threading.Lock()
 current_source = VIDEO_SOURCE
-source_changed = False
-
 # Upload Mode State (Isolated)
 upload_status = {"status": "idle", "progress": 0}
 last_upload_frame = None
 upload_lock = threading.Lock()
+live_thread_running = True
 
 @app.route('/api/upload_video', methods=['POST'])
 def upload_video():
@@ -168,11 +169,44 @@ def upload_video_feed():
 # Live webcam and RTSP capture code are disabled per user requirements.
 # The system now uses a file-based pipeline for higher reliability and proximity-based OCR.
 
-# ==========================================
-# VIDEO PIPELINE INITIALIZATION
-# ==========================================
-# The system now uses a manual upload-and-analyze approach.
-# Automatic processing on startup is disabled.
+def background_capture():
+    """Background thread to capture from LIVE camera and process frames."""
+    global last_frame, live_thread_running
+    print(f"[Live] Background capture thread started (Source: {VIDEO_SOURCE})")
+    
+    cap = cv2.VideoCapture(VIDEO_SOURCE)
+    is_file = isinstance(VIDEO_SOURCE, str)
+    
+    while live_thread_running:
+        ret, frame = cap.read()
+        if not ret:
+            if is_file:
+                # Loop video for continuous live demo
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            else:
+                print("[Live] Failed to read from camera. Retrying...")
+                cap.release()
+                time.sleep(2)
+                cap = cv2.VideoCapture(VIDEO_SOURCE)
+                continue
+            
+        # 1. Process Frame using core intelligence
+        # This handles detection, tracking, crossing, and OCR triggering
+        annotated_frame = processor.process_frame(frame)
+        
+        # 2. Update global last_frame for MJPEG streaming
+        with lock:
+            last_frame = annotated_frame.copy()
+            
+        # Limit CPU usage (Live processing at ~15-20 FPS is sufficient)
+        time.sleep(0.01)
+
+    cap.release()
+    print("[Live] Background capture thread stopped.")
+
+# [DISABLED] Start the background capture thread
+# threading.Thread(target=background_capture, daemon=True).start()
 
 def generate_frames():
     global last_frame
@@ -198,6 +232,16 @@ def generate_frames():
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/list_cameras')
+def list_cameras():
+    """Mock camera list for UI compatibility."""
+    return jsonify([{"id": 0, "name": "Primary Camera (CCTV)"}])
+
+@app.route('/api/reset_camera', methods=['POST'])
+def reset_camera():
+    """Reset camera state (Mock)."""
+    return jsonify({"status": "success"})
 
 @app.route('/api/logs')
 def logs():
@@ -254,19 +298,20 @@ def check_image():
                 if plate_crop.size == 0:
                     return jsonify({"plate_text": "NOT DETECTED", "confidence": 0, "plate_image": None, "metrics": {"yolo": round(yolo_time, 2), "ocr": 0}})
 
-                # Apply Professional ISP Preprocessing
-                plate_crop_enhanced = apply_professional_restoration(plate_crop)
+                # Apply Professional ISP Preprocessing (Returns [pass_a, pass_b, pass_c])
+                plate_versions = apply_professional_restoration(plate_crop)
+                # Use Pass A (Grayscale) for initial display and OCR
+                plate_crop_enhanced = plate_versions[0]
                 
                 _, buffer = cv2.imencode('.jpg', plate_crop_enhanced)
                 plate_img_b64 = base64.b64encode(buffer).decode('utf-8')
                 
-                # Save to temp file with unique name to prevent race conditions
                 # Start OCR Metrics
                 start_ocr = time.time()
-                ocr_time = 0 # Initialize to avoid UnboundLocalError
+                ocr_time = 0 
                 
                 try:
-                    # Directly pass numpy array to PaddleOCR for memory-only processing
+                    # Directly pass numpy array to PaddleOCR
                     result = processor.ocr.ocr(plate_crop_enhanced, cls=True)
                     ocr_time = (time.time() - start_ocr) * 1000 # ms
                     
