@@ -48,6 +48,10 @@ function App() {
             try {
                 const res = await axios.get(`${API_BASE}/api/list_cameras`);
                 setAvailableCameras(res.data);
+                // Sync current ID with backend's first choice if not already set
+                if (res.data.length > 0 && currentCamId === 0) {
+                    setCurrentCamId(res.data[0].id);
+                }
             } catch (err) {
                 console.error("Error fetching cameras:", err);
             }
@@ -269,6 +273,10 @@ function App() {
                             <div className="glass-card status-card">
                                 <div className={`status-indicator ${status.includes('Processing') ? 'processing' : ''}`}></div>
                                 <span className="status-text">{status}</span>
+                                <div className="camera-count-badge">
+                                    <div className="pulse-dot-small"></div>
+                                    <span>{availableCameras.length} Online</span>
+                                </div>
                             </div>
 
                             <div className="mode-tabs">
@@ -307,35 +315,117 @@ function App() {
                         <main className="main-grid">
                             {appMode === 'live' ? (
                                 <section className={`feed-section ${activeTab === 'feed' ? 'active' : ''}`}>
-                                    <motion.div
-                                        className="glass-card feed-container"
-                                        initial={{ opacity: 0, scale: 0.95 }}
-                                        animate={{ opacity: 1, scale: 1 }}
-                                        transition={{ duration: 0.5 }}
-                                    >
-                                        <div className="feed-header">
-                                            <div className="flex-row">
-                                                <div className="source-info">
-                                                    <span className="source-label">
-                                                        CCTV FEED (CAM 0)
-                                                    </span>
-                                                    <div className="activity-tag">
-                                                        <Activity size={10} className="pulse" />
-                                                        <span>Live Analytics</span>
+                                    <div className="live-layout-unified">
+                                        {/* Main Live AI Feed Area */}
+                                        <motion.div
+                                            className="glass-card feed-container-large"
+                                            initial={{ opacity: 0, scale: 0.98 }}
+                                            animate={{ opacity: 1, scale: 1 }}
+                                            transition={{ duration: 0.5 }}
+                                        >
+                                            <div className="feed-header">
+                                                <div className="flex-row items-center justify-between full-width">
+                                                    <div className="source-info">
+                                                        <div className="flex-row items-center gap-2">
+                                                            <div className="live-indicator-ring">
+                                                                <div className="pulse-dot"></div>
+                                                            </div>
+                                                            <span className="source-label-premium">
+                                                                {availableCameras.find(c => c.id === currentCamId)?.name || 'CCTV SENSOR ACTIVE'}
+                                                            </span>
+                                                        </div>
+                                                        <div className="activity-tag-premium">
+                                                            <Activity size={12} className="pulse" />
+                                                            <span>Elite Analytics Pipeline v4</span>
+                                                        </div>
+                                                    </div>
+
+                                                    {/* Professional Camera Selection Dropdown */}
+                                                    <div className="camera-selector-professional">
+                                                        <button
+                                                            className="pro-dropdown-trigger"
+                                                            onClick={() => setShowCameraMenu(!showCameraMenu)}
+                                                        >
+                                                            <div className="trigger-content">
+                                                                <Camera size={16} />
+                                                                <span>SWITCH SENSOR</span>
+                                                                <ChevronDown size={14} className={showCameraMenu ? 'rotate-180' : ''} />
+                                                            </div>
+                                                        </button>
+
+                                                        <AnimatePresence>
+                                                            {showCameraMenu && (
+                                                                <motion.div
+                                                                    className="pro-dropdown-menu"
+                                                                    initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                                                                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                                                                    exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                                                                >
+                                                                    <div className="dropdown-label">AVAILABLE SENSORS</div>
+                                                                    <div className="scrolling-items">
+                                                                        {availableCameras.map((cam) => (
+                                                                            <button
+                                                                                key={cam.id}
+                                                                                className={`pro-dropdown-item ${currentCamId === cam.id ? 'active' : ''}`}
+                                                                                onClick={() => {
+                                                                                    handleResetCamera(cam.id);
+                                                                                    setShowCameraMenu(false);
+                                                                                }}
+                                                                            >
+                                                                                <div className="item-left">
+                                                                                    <div className={`status-dot ${currentCamId === cam.id ? 'online' : 'idle'}`}></div>
+                                                                                    <span>{cam.name}</span>
+                                                                                </div>
+                                                                                {currentCamId === cam.id && <div className="live-chip">LIVE</div>}
+                                                                            </button>
+                                                                        ))}
+                                                                    </div>
+                                                                    <div className="dropdown-footer">
+                                                                        <button
+                                                                            className="refresh-sensors-btn"
+                                                                            onClick={async (e) => {
+                                                                                e.stopPropagation();
+                                                                                const res = await axios.get(`${API_BASE}/api/list_cameras`);
+                                                                                setAvailableCameras(res.data);
+                                                                            }}
+                                                                        >
+                                                                            <RotateCcw size={12} />
+                                                                            <span>Scan Hardware</span>
+                                                                        </button>
+                                                                    </div>
+                                                                </motion.div>
+                                                            )}
+                                                        </AnimatePresence>
                                                     </div>
                                                 </div>
                                             </div>
-                                        </div>
 
-                                        <div className="wip-container">
-                                            <div className="wip-content">
-                                                <Construction size={64} color="#00f2fe" opacity={0.5} />
-                                                <h2>Work in Progress</h2>
-                                                <p>Live Monitoring is currently being optimized.</p>
-                                                <div className="wip-hint">Please use VIDEO ANALYSIS tab for processing</div>
+                                            <div className="feed-media-container-large">
+                                                <img
+                                                    className="ai-feed-player-large"
+                                                    src={`${API_BASE}/video_feed?t=${Date.now()}`}
+                                                    alt="Live AI Feed"
+                                                    onError={(e) => {
+                                                        setTimeout(() => {
+                                                            if (e.target) e.target.src = `${API_BASE}/video_feed?t=${Date.now()}`;
+                                                        }, 2000);
+                                                    }}
+                                                />
+
+                                                {/* On-Feed HUD Overlay */}
+                                                <div className="feed-hud">
+                                                    <div className="hud-pill pipeline-pill">
+                                                        <Activity size={10} />
+                                                        <span>YOLOv8 + ByteTrack Active</span>
+                                                    </div>
+                                                    <div className="hud-pill status-pill">
+                                                        <div className="pulse-dot-small"></div>
+                                                        <span>Processing Frames</span>
+                                                    </div>
+                                                </div>
                                             </div>
-                                        </div>
-                                    </motion.div>
+                                        </motion.div>
+                                    </div>
                                 </section>
                             ) : (
                                 <section className="upload-mode-section">

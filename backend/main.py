@@ -33,32 +33,60 @@ CORS(app)
 def health():
     return jsonify({"status": "healthy", "timestamp": time.time()})
 
-# For demo purposes, we use bus.mp4 as the "Live" source. 
+# For demo purposes, we use bus.mp4 as the default "Live" source. 
 # Set to 0 for real webcam.
-VIDEO_SOURCE = "bus.mp4" 
+def detect_cameras():
+    """Scans for available hardware cameras."""
+    available = []
+    
+    # 1. Scan indices 0-4 for real USB/Integrated cameras
+    found_hardware = False
+    for i in range(5):
+        try:
+            # CAP_DSHOW on Windows is often faster to initialize
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW) if os.name == 'nt' else cv2.VideoCapture(i)
+            if cap.isOpened():
+                ret, _ = cap.read()
+                if ret:
+                    available.append({"id": i, "name": f"Camera Sensor {i} (Hardware)"})
+                    found_hardware = True
+                cap.release()
+        except:
+            continue
+            
+    # 2. Add demo source as a fallback/alternative
+    available.append({"id": "bus.mp4", "name": "Simulated CCTV (Demo File)"})
+    return available
 
-# Initialize processors (Isolated)
-# Line config for Live/File Pipeline (Adjusted for bus.mp4)
-LIVE_LINE_POS = 0.5
-LIVE_LINE_DIR = 'vertical'
+# Auto-detect on startup
+detected = detect_cameras()
+# Default to first hardware camera if it exists, otherwise use demo
+VIDEO_SOURCE = detected[0]["id"] if detected else "bus.mp4"
 
-print("Initializing BusProcessor (File-based Stream)...")
+# Initialize processors — BOTH use the SAME pipeline configuration
+# Horizontal line at 60% height is the standard for bus monitoring
+LIVE_LINE_POS = 0.6
+LIVE_LINE_DIR = 'horizontal'
+
+print(f"Initializing BusProcessor for Live Stream (Default Source: {VIDEO_SOURCE})...")
 processor = BusProcessor(line_position=LIVE_LINE_POS, line_direction=LIVE_LINE_DIR)
 
-print("Initializing VideoUploadProcessor (Manual Upload)...")
-# For manual uploads, a horizontal line at 60% height is often standard
-upload_processor = VideoUploadProcessor(line_position=0.6, line_direction='horizontal')
+print("Initializing VideoUploadProcessor (Manual Upload Filter Only)...")
+upload_processor = VideoUploadProcessor(line_position=LIVE_LINE_POS, line_direction=LIVE_LINE_DIR)
 print("Processors Ready.")
 
 # Global state
 last_frame = None
 lock = threading.Lock()
 current_source = VIDEO_SOURCE
-# Upload Mode State (Isolated)
+# Thread Control
+live_thread_token = 0 # Incremented each time we switch cameras
+live_thread_running = True
+
+# Upload Mode State (Isolated) — RESTORED
 upload_status = {"status": "idle", "progress": 0}
 last_upload_frame = None
 upload_lock = threading.Lock()
-live_thread_running = True
 
 @app.route('/api/upload_video', methods=['POST'])
 def upload_video():
@@ -164,38 +192,58 @@ def upload_video_feed():
     return Response(generate_upload_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 # ==========================================
-# DISABLE LIVE CAMERA FUNCTIONALITY
+# LIVE MONITORING (Elite-v4 Pipeline)
 # ==========================================
-# Live webcam and RTSP capture code are disabled per user requirements.
-# The system now uses a file-based pipeline for higher reliability and proximity-based OCR.
+# Uses the same BusProcessor.process_frame() as the Video Analyzer.
+# Supports hardware cameras (USB/CCTV via CAP_DSHOW on Windows) and file-based demo streams.
 
-def background_capture():
+def background_capture(token):
     """Background thread to capture from LIVE camera and process frames."""
-    global last_frame, live_thread_running
-    print(f"[Live] Background capture thread started (Source: {VIDEO_SOURCE})")
+    global last_frame, live_thread_token
+    print(f"[Live] Thread {token} started for Source: {VIDEO_SOURCE}")
     
-    cap = cv2.VideoCapture(VIDEO_SOURCE)
-    is_file = isinstance(VIDEO_SOURCE, str)
+    is_file = isinstance(VIDEO_SOURCE, str) and not VIDEO_SOURCE.startswith('rtsp')
     
-    while live_thread_running:
+    # Use CAP_DSHOW on Windows for faster hardware camera initialization
+    if isinstance(VIDEO_SOURCE, int) and os.name == 'nt':
+        cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_DSHOW)
+    else:
+        cap = cv2.VideoCapture(VIDEO_SOURCE)
+    
+    # Set a session name for the live stream
+    source_name = f"cam_{VIDEO_SOURCE}" if isinstance(VIDEO_SOURCE, int) else "demo_live"
+    processor.set_session(f"live_{source_name}_{int(time.time())}")
+    
+    while True:
+        # Check if this thread is still the active one
+        if token != live_thread_token:
+            print(f"[Live] Thread {token} exiting (Stale).")
+            break
         ret, frame = cap.read()
         if not ret:
             if is_file:
                 # Loop video for continuous live demo
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                # Reset processor state so the same buses aren't re-logged
+                processor.tracking_history = {}
+                processor.processed_ids = set()
+                processor.proximity_states = {}
+                print("[Live] Demo video looped — processor state reset.")
                 continue
             else:
                 print("[Live] Failed to read from camera. Retrying...")
                 cap.release()
                 time.sleep(2)
-                cap = cv2.VideoCapture(VIDEO_SOURCE)
+                if isinstance(VIDEO_SOURCE, int) and os.name == 'nt':
+                    cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_DSHOW)
+                else:
+                    cap = cv2.VideoCapture(VIDEO_SOURCE)
                 continue
             
-        # 1. Process Frame using core intelligence
-        # This handles detection, tracking, crossing, and OCR triggering
+        # Process Frame using the SAME core intelligence as Video Analyzer
         annotated_frame = processor.process_frame(frame)
         
-        # 2. Update global last_frame for MJPEG streaming
+        # Update global last_frame for MJPEG streaming
         with lock:
             last_frame = annotated_frame.copy()
             
@@ -205,8 +253,8 @@ def background_capture():
     cap.release()
     print("[Live] Background capture thread stopped.")
 
-# [DISABLED] Start the background capture thread
-# threading.Thread(target=background_capture, daemon=True).start()
+# Start the background capture thread
+threading.Thread(target=background_capture, args=(0,), daemon=True).start()
 
 def generate_frames():
     global last_frame
@@ -235,13 +283,43 @@ def video_feed():
 
 @app.route('/api/list_cameras')
 def list_cameras():
-    """Mock camera list for UI compatibility."""
-    return jsonify([{"id": 0, "name": "Primary Camera (CCTV)"}])
+    """Returns detected hardware and demo sources."""
+    try:
+        cameras = detect_cameras()
+        return jsonify(cameras)
+    except Exception as e:
+        return jsonify([{"id": VIDEO_SOURCE, "name": "Default Stream"}]), 200
 
 @app.route('/api/reset_camera', methods=['POST'])
 def reset_camera():
-    """Reset camera state (Mock)."""
-    return jsonify({"status": "success"})
+    """Switch the live VIDEO_SOURCE and restart capture."""
+    global VIDEO_SOURCE, live_thread_token
+    data = request.json or {}
+    new_id = data.get('index') # Standardizing on 'index' key from UI
+    
+    if new_id is not None:
+        # Convert to int if it's a numeric index
+        try:
+            if str(new_id).isdigit():
+                new_id = int(new_id)
+        except: pass
+        
+        print(f"[System] Switching Live Source to: {new_id}")
+        
+        # Increment token - this effectively kills old threads
+        live_thread_token += 1
+        
+        # Update source
+        VIDEO_SOURCE = new_id
+        
+        # Reset processor for fresh start
+        processor.reset()
+        
+        # Start new thread with new token
+        threading.Thread(target=background_capture, args=(live_thread_token,), daemon=True).start()
+        return jsonify({"status": "success", "new_source": str(new_id)})
+    
+    return jsonify({"status": "error", "message": "No index provided"}), 400
 
 @app.route('/api/logs')
 def logs():
