@@ -13,3 +13,4 @@ streamlit
 shapely
 streamlit-lottie
 requests
+pygrabber

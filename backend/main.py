@@ -17,7 +17,7 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import cv2
 import torch
-from processor import BusProcessor, VideoUploadProcessor, apply_professional_restoration, extract_indian_number_plate
+from processor import BusProcessor, VideoUploadProcessor, apply_professional_restoration, extract_indian_number_plate, deskew_plate, apply_padding
 from database import get_recent_logs
 import threading
 import time
@@ -25,6 +25,15 @@ import os
 import numpy as np
 import base64
 import re
+
+# NEW: Capture camera names on Windows
+if os.name == 'nt':
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+    except ImportError:
+        FilterGraph = None
+else:
+    FilterGraph = None
 
 app = Flask(__name__)
 CORS(app)
@@ -36,32 +45,53 @@ def health():
 # For demo purposes, we use bus.mp4 as the default "Live" source. 
 # Set to 0 for real webcam.
 def detect_cameras():
-    """Scans for available hardware cameras."""
+    """Detects available hardware cameras with friendly names on Windows."""
     available = []
     
-    # 1. Scan indices 0-4 for real USB/Integrated cameras
-    found_hardware = False
-    for i in range(5):
+    # 1. Capture names using pygrabber on Windows
+    device_names = []
+    if os.name == 'nt' and FilterGraph:
         try:
-            # CAP_DSHOW on Windows is often faster to initialize
+            graph = FilterGraph()
+            device_names = graph.get_input_devices()
+        except Exception as e:
+            print(f"[System] Warning: Could not resolve camera names: {e}")
+            device_names = []
+
+    # 2. Scan cameras and match with names
+    for i in range(8): # Check up to 8 slots
+        try:
             cap = cv2.VideoCapture(i, cv2.CAP_DSHOW) if os.name == 'nt' else cv2.VideoCapture(i)
             if cap.isOpened():
+                # Force standard resolution and MJPG format to prevent DirectShow decoding glitches
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 ret, _ = cap.read()
                 if ret:
-                    available.append({"id": i, "name": f"Camera Sensor {i} (Hardware)"})
-                    found_hardware = True
+                    friendly_name = f"Camera {i}"
+                    if i < len(device_names):
+                        friendly_name = device_names[i]
+                    
+                    available.append({
+                        "id": i, 
+                        "name": f"{friendly_name.upper()} (SENSOR {i})"
+                    })
                 cap.release()
-        except:
+        except Exception as e:
+            print(f"[System] Skipping camera {i}: {e}")
             continue
             
-    # 2. Add demo source as a fallback/alternative
-    available.append({"id": "bus.mp4", "name": "Simulated CCTV (Demo File)"})
+    # Add demo source
+    available.append({"id": "bus.mp4", "name": "SIMULATED CCTV (DEMO FILE)"})
     return available
 
-# Auto-detect on startup
-detected = detect_cameras()
+# Auto-detect on startup to prevent DSHOW crashes later
+print("[System] Scanning for hardware cameras (One-time startup check)...")
+DETECTED_CAMERAS = detect_cameras()
+
 # Default to first hardware camera if it exists, otherwise use demo
-VIDEO_SOURCE = detected[0]["id"] if detected else "bus.mp4"
+VIDEO_SOURCE = DETECTED_CAMERAS[0]["id"] if DETECTED_CAMERAS else "bus.mp4"
 
 # Initialize processors — BOTH use the SAME pipeline configuration
 # Horizontal line at 60% height is the standard for bus monitoring
@@ -75,12 +105,11 @@ print("Initializing VideoUploadProcessor (Manual Upload Filter Only)...")
 upload_processor = VideoUploadProcessor(line_position=LIVE_LINE_POS, line_direction=LIVE_LINE_DIR)
 print("Processors Ready.")
 
-# Global state
+# Global State for Live Feed
 last_frame = None
 lock = threading.Lock()
-current_source = VIDEO_SOURCE
-# Thread Control
-live_thread_token = 0 # Incremented each time we switch cameras
+live_thread_token = 0
+live_mode_active = True # NEW: Flag to pause live tracking
 live_thread_running = True
 
 # Upload Mode State (Isolated) — RESTORED
@@ -129,12 +158,31 @@ def process_uploaded_video():
                 upload_status["progress"] = p
 
         def update_frame(frame):
-            global last_upload_frame
-            with upload_lock:
-                # Crucial: copy frame to avoid memory corruption during async MJPEG encoding
-                last_upload_frame = frame.copy()
+            try:
+                global last_upload_frame
+                with upload_lock:
+                    h, w = frame.shape[:2]
+                    preview_h = 480
+                    preview_w = int(w * (preview_h / h))
+                    preview_w = (preview_w // 2) * 2
+                    preview_frame = cv2.resize(frame, (preview_w, preview_h), interpolation=cv2.INTER_LINEAR)
+                    last_upload_frame = np.ascontiguousarray(preview_frame)
+            except Exception as e:
+                import traceback
+                with open("C:/Users/bharg/Desktop/for_n/debug_update_frame_error.txt", "w") as f_err:
+                    traceback.print_exc(file=f_err)
+                raise
 
         try:
+            # Basic cleanup: Keep only the most recent few uploads to save space
+            files = sorted([os.path.join('uploads', f) for f in os.listdir('uploads') if os.path.isfile(os.path.join('uploads', f))], key=os.path.getmtime)
+            if len(files) > 15:
+                for f in files[:-15]:
+                    try: 
+                        os.remove(f)
+                    except Exception as e: 
+                        print(f"Could not remove old file {f}: {e}")
+
             print(f"[Upload] Starting processing for {file_path}")
             upload_processor.process_video(file_path, progress_callback=update_progress, frame_callback=update_frame)
             with upload_lock:
@@ -142,7 +190,11 @@ def process_uploaded_video():
                 upload_status["progress"] = 100
             print("[Upload] Processing finished successfully.")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"!!! Upload Process Error: {e}")
+            with open("C:/Users/bharg/Desktop/for_n/debug_error.txt", "w") as f_err:
+                traceback.print_exc(file=f_err)
             with upload_lock:
                 upload_status["status"] = "error"
 
@@ -156,36 +208,44 @@ def get_upload_status():
 
 def generate_upload_frames():
     global last_upload_frame
-    # Wait up to 5 seconds for processing to actually start
     for i in range(50): 
         if last_upload_frame is not None: break
         time.sleep(0.1)
 
     while True:
-        with upload_lock:
-            # If processing is error/idle and no frame yet, stop stream to avoid hanging browser
-            if last_upload_frame is None and upload_status["status"] in ["error", "idle"]:
-                break
-
-            if last_upload_frame is None:
-                # Create a simple "Processing..." placeholder frame in-memory if no frame yet
-                placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(placeholder, "INITIALIZING AI PIPELINE...", (100, 240), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 242, 254), 2)
-                ret, buffer = cv2.imencode('.jpg', placeholder)
-            else:
-                ret, buffer = cv2.imencode('.jpg', last_upload_frame)
-            
-            if not ret:
-                time.sleep(0.1)
-                continue
-            frame_bytes = buffer.tobytes()
+        frame_to_use = None
+        status_info = None
         
+        with upload_lock:
+            status_info = upload_status["status"]
+            if last_upload_frame is None and status_info in ["error", "idle"]:
+                break
+            
+            if last_upload_frame is not None:
+                # Safe copy under lock
+                frame_to_use = last_upload_frame.copy()
+        
+        # Determine what to encode
+        if frame_to_use is None:
+            # Create a simple "Processing..." placeholder frame in-memory if no frame yet
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(placeholder, "INITIALIZING AI PIPELINE...", (100, 240), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 242, 254), 2)
+            ret, buffer = cv2.imencode('.jpg', placeholder, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        else:
+            # Encode OUTSIDE the lock
+            ret, buffer = cv2.imencode('.jpg', frame_to_use, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        
+        if not ret:
+            time.sleep(0.01)
+            continue
+        
+        frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         
-        # Limit frame rate for the feed to save bandwidth/CPU
-        time.sleep(0.06) # ~16 FPS is enough for visual feedback
+        # High Speed Manual Analysis Feed
+        time.sleep(0.01)
 
 @app.route('/upload_video_feed')
 def upload_video_feed():
@@ -200,57 +260,116 @@ def upload_video_feed():
 def background_capture(token):
     """Background thread to capture from LIVE camera and process frames."""
     global last_frame, live_thread_token
-    print(f"[Live] Thread {token} started for Source: {VIDEO_SOURCE}")
     
     is_file = isinstance(VIDEO_SOURCE, str) and not VIDEO_SOURCE.startswith('rtsp')
+    print(f"[Live] Thread {token} active for source {VIDEO_SOURCE}")
     
-    # Use CAP_DSHOW on Windows for faster hardware camera initialization
+    cap = None
     if isinstance(VIDEO_SOURCE, int) and os.name == 'nt':
         cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            print(f"[Live] Hardware camera initialized.")
     else:
         cap = cv2.VideoCapture(VIDEO_SOURCE)
+        if isinstance(VIDEO_SOURCE, int) and cap.isOpened():
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    is_file = not isinstance(VIDEO_SOURCE, int)
     
     # Set a session name for the live stream
     source_name = f"cam_{VIDEO_SOURCE}" if isinstance(VIDEO_SOURCE, int) else "demo_live"
     processor.set_session(f"live_{source_name}_{int(time.time())}")
     
     while True:
-        # Check if this thread is still the active one
         if token != live_thread_token:
             print(f"[Live] Thread {token} exiting (Stale).")
             break
+        
+        # [ELITE RESOURCE MANAGEMENT]
+        # Physically release the camera if live mode is inactive
+        if not live_mode_active:
+            if cap is not None and cap.isOpened():
+                try:
+                    print("[System] Releasing camera hardware for resource optimization.")
+                    cap.release()
+                    cap = None
+                except Exception as e:
+                    print(f"[Warning] Camera release error: {e}")
+            time.sleep(0.5)
+            continue
+        
+        # Re-open if we were paused and now active
+        if cap is None or not cap.isOpened():
+            print("[Debug] Entering camera re-init block...")
+            time.sleep(0.2) # Give hardware time to settle
+            try:
+                if isinstance(VIDEO_SOURCE, int) and os.name == 'nt':
+                    print(f"[Debug] Attempting cv2.VideoCapture({VIDEO_SOURCE}, DSHOW)...")
+                    cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_DSHOW)
+                else:
+                    print(f"[Debug] Attempting cv2.VideoCapture({VIDEO_SOURCE})...")
+                    cap = cv2.VideoCapture(VIDEO_SOURCE)
+                
+                # [CRITICAL FIX] Force resolution and MJPG to prevent DSHOW byte-stride / MJPEG decoding corruption
+                if isinstance(VIDEO_SOURCE, int):
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                
+                print("[Live] Camera hardware re-initialized.")
+            except Exception as e:
+                print(f"[Critical] VideoCapture Exception: {e}")
+                continue
+
         ret, frame = cap.read()
         if not ret:
             if is_file:
-                # Loop video for continuous live demo
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                # Reset processor state so the same buses aren't re-logged
-                processor.tracking_history = {}
-                processor.processed_ids = set()
-                processor.proximity_states = {}
-                print("[Live] Demo video looped — processor state reset.")
+                processor.reset()
                 continue
             else:
-                print("[Live] Failed to read from camera. Retrying...")
-                cap.release()
-                time.sleep(2)
-                if isinstance(VIDEO_SOURCE, int) and os.name == 'nt':
-                    cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_DSHOW)
-                else:
-                    cap = cv2.VideoCapture(VIDEO_SOURCE)
+                time.sleep(1)
                 continue
-            
-        # Process Frame using the SAME core intelligence as Video Analyzer
-        annotated_frame = processor.process_frame(frame)
         
-        # Update global last_frame for MJPEG streaming
-        with lock:
-            last_frame = annotated_frame.copy()
+        # [NEW] Ensure contiguous memory layout immediately after capture
+        # This prevents stride/mosaic artifacts in many MJPEG implementations
+        frame = np.ascontiguousarray(frame)
             
-        # Limit CPU usage (Live processing at ~15-20 FPS is sufficient)
-        time.sleep(0.01)
+        # Process and Resize for preview
+        try:
+            # print(f"[Debug] Processing frame (ID: {id(frame)})...")
+            annotated_frame = processor.process_frame(frame)
+        except Exception as e:
+            print(f"[Critical] processor.process_frame crash: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
 
-    cap.release()
+        if annotated_frame is None:
+            continue
+
+        # print("[Debug] Drawing/Resizing for preview...")
+        h, w = annotated_frame.shape[:2]
+        preview_h = 480
+        preview_w = int(w * (preview_h / h))
+        preview_w = (preview_w // 2) * 2 
+        preview_frame = cv2.resize(annotated_frame, (preview_w, preview_h), interpolation=cv2.INTER_LINEAR)
+        
+        # Immediate copy for the global state
+        fixed_frame = np.ascontiguousarray(preview_frame)
+
+        with lock:
+            last_frame = fixed_frame
+            
+        # Turbo Performance (1ms yield)
+        time.sleep(0.001)
+
+    if cap: cap.release()
     print("[Live] Background capture thread stopped.")
 
 # Start the background capture thread
@@ -259,34 +378,49 @@ threading.Thread(target=background_capture, args=(0,), daemon=True).start()
 def generate_frames():
     global last_frame
     while True:
+        frame_to_use = None
         with lock:
-            if last_frame is None:
-                time.sleep(0.1)
-                continue
-            
-            # Encode as JPEG
-            ret, buffer = cv2.imencode('.jpg', last_frame)
-            if not ret:
-                time.sleep(0.1)
-                continue
-            frame_bytes = buffer.tobytes()
+            if last_frame is not None:
+                # Safe copy under lock to prevent tiling/concurrency issues
+                frame_to_use = last_frame.copy()
         
+        if frame_to_use is None:
+            time.sleep(0.1)
+            continue
+            
+        # Encode OUTSIDE the lock to keep the frame-rate high and prevent stalling
+        ret, buffer = cv2.imencode('.jpg', frame_to_use, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ret:
+            time.sleep(0.01)
+            continue
+        
+        frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         
-        # Limit frame rate for the feed
-        time.sleep(0.05)
+        # High Speed Stream (~100 FPS Max)
+        time.sleep(0.01)
 
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+@app.route('/api/toggle_live', methods=['POST'])
+def toggle_live():
+    global live_mode_active
+    data = request.json
+    live_mode_active = data.get('active', True)
+    status_str = "RESUMED" if live_mode_active else "PAUSED"
+    print(f"[System] Live Monitoring {status_str} to save resources.")
+    return jsonify({"status": "success", "live_active": live_mode_active})
+
 @app.route('/api/list_cameras')
 def list_cameras():
     """Returns detected hardware and demo sources."""
     try:
-        cameras = detect_cameras()
-        return jsonify(cameras)
+        # [CRITICAL FIX] Return the startup cached cameras!
+        # Repeatedly polling cv2.VideoCapture(DSHOW) concurrently crashes the backend.
+        return jsonify(DETECTED_CAMERAS)
     except Exception as e:
         return jsonify([{"id": VIDEO_SOURCE, "name": "Default Stream"}]), 200
 
@@ -302,7 +436,8 @@ def reset_camera():
         try:
             if str(new_id).isdigit():
                 new_id = int(new_id)
-        except: pass
+        except Exception as e: 
+            print(f"Warning: Could not parse camera ID numeric value: {e}")
         
         print(f"[System] Switching Live Source to: {new_id}")
         
@@ -389,17 +524,39 @@ def check_image():
                 ocr_time = 0 
                 
                 try:
-                    # Directly pass numpy array to PaddleOCR
-                    result = processor.ocr.ocr(plate_crop_enhanced, cls=True)
-                    ocr_time = (time.time() - start_ocr) * 1000 # ms
+                    # Elite Preprocessing: Deskew + Pad
+                    plate_crop = deskew_plate(plate_crop)
+                    plate_crop = apply_padding(plate_crop, pad=15)
                     
-                    if result and result[0]:
-                        raw_texts = []
-                        for idx in range(len(result)):
-                            for line in result[idx]:
-                                raw_texts.append(line[1][0])
+                    # [STRICT] Multi-Pass OCR for static image check
+                    versions = apply_professional_restoration(plate_crop)
+                    all_results = []
+                    
+                    for v_idx, v_img in enumerate(versions):
+                        with processor.lock:
+                            res = processor.ocr.ocr(v_img, cls=True)
+                        if res and res[0]:
+                            lines = [line[1] for idx in range(len(res)) for line in res[idx]]
+                            raw_t = "".join([l[0] for l in lines])
+                            conf_val = sum([l[1] for l in lines]) / len(lines) if lines else 0
+                            
+                            # Weight format matches higher
+                            clean_t = extract_indian_number_plate([raw_t])
+                            if clean_t != "UNKNOWN":
+                                all_results.append((clean_t, conf_val + 0.2)) # Priority to strict format
+                                raw_texts.append(f"Pass {chr(65+v_idx)}: {clean_t} (STRICT)")
+                            else:
+                                clean_l = re.sub(r'[^A-Z0-9]', '', raw_t.upper())
+                                all_results.append((clean_l, conf_val))
+                                raw_texts.append(f"Pass {chr(65+v_idx)}: {clean_l}")
+
+                    if all_results:
+                        # Perform voting even on a single image's multiple passes
+                        plate_text = processor.character_voting(all_results)
+                        # Final strict check
+                        plate_text = extract_indian_number_plate([plate_text])
                         
-                        plate_text = extract_indian_number_plate(raw_texts)
+                    ocr_time = (time.time() - start_ocr) * 1000 # ms
                 except Exception as e:
                     print("!!! OCR CRITICAL ERROR !!!")
                     import traceback

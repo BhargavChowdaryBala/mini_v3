@@ -20,7 +20,6 @@ function App() {
     const videoRef = React.useRef(null);
     const canvasRef = React.useRef(null);
     const fileInputRef = React.useRef(null);
-    const [isVideoMode, setIsVideoMode] = useState(false); // Legacy - keep for minimal compatibility if needed elsewhere, but effectively unused
     const [currentPage, setCurrentPage] = useState('dashboard'); // 'dashboard' or 'image-checker'
     const [analysisResult, setAnalysisResult] = useState(null);
     const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -33,9 +32,17 @@ function App() {
     const [vProgress, setVProgress] = useState(0);
     const [vPlatesDetected, setVPlatesDetected] = useState(0);
 
-    const videoPreviewUrl = React.useMemo(() => {
-        if (!videoFile) return null;
-        return URL.createObjectURL(videoFile);
+    const [videoPreviewUrl, setVideoPreviewUrl] = useState(null);
+
+    useEffect(() => {
+        if (videoFile) {
+            const url = URL.createObjectURL(videoFile);
+            setVideoPreviewUrl(url);
+            return () => {
+                URL.revokeObjectURL(url);
+                setVideoPreviewUrl(null);
+            };
+        }
     }, [videoFile]);
 
     const aiFeedUrl = React.useMemo(() => {
@@ -81,6 +88,21 @@ function App() {
         const interval = setInterval(fetchData, 3000); // Relaxed interval
         return () => clearInterval(interval);
     }, [useMobileCamera, appMode]);
+
+    // NEW: Auto-Toggle backend live monitoring to save resources
+    useEffect(() => {
+        const toggleLiveBackend = async () => {
+            try {
+                // appMode 'live' -> backend active=true, otherwise active=false
+                await axios.post(`${API_BASE}/api/toggle_live`, {
+                    active: appMode === 'live'
+                });
+            } catch (err) {
+                console.error("Error toggling live mode:", err);
+            }
+        };
+        toggleLiveBackend();
+    }, [appMode]);
 
     // Mobile Camera logic
     useEffect(() => {
@@ -162,7 +184,6 @@ function App() {
     const handleResetCamera = async (index = 0) => {
         try {
             await axios.post(`${API_BASE}/api/reset_camera`, { index });
-            setIsVideoMode(false);
             setUseMobileCamera(false);
             setCurrentCamId(index);
             setShowCameraMenu(false);
@@ -288,7 +309,10 @@ function App() {
                                 </button>
                                 <button
                                     className={`mode-tab ${appMode === 'upload' ? 'active' : ''}`}
-                                    onClick={() => setAppMode('upload')}
+                                    onClick={() => {
+                                        setAppMode('upload');
+                                        setUseMobileCamera(false); // [FIX] Ensure mobile camera turns off when switching
+                                    }}
                                 >
                                     VIDEO ANALYSIS
                                 </button>
@@ -401,16 +425,23 @@ function App() {
                                             </div>
 
                                             <div className="feed-media-container-large">
-                                                <img
-                                                    className="ai-feed-player-large"
-                                                    src={`${API_BASE}/video_feed?t=${Date.now()}`}
-                                                    alt="Live AI Feed"
-                                                    onError={(e) => {
-                                                        setTimeout(() => {
-                                                            if (e.target) e.target.src = `${API_BASE}/video_feed?t=${Date.now()}`;
-                                                        }, 2000);
-                                                    }}
-                                                />
+                                                {appMode === 'live' ? (
+                                                    <img
+                                                        className="ai-feed-player-large"
+                                                        src={`${API_BASE}/video_feed?t=${Date.now()}`}
+                                                        alt="Live AI Feed"
+                                                        onError={(e) => {
+                                                            setTimeout(() => {
+                                                                if (e.target) e.target.src = `${API_BASE}/video_feed?t=${Date.now()}`;
+                                                            }, 2000);
+                                                        }}
+                                                    />
+                                                ) : (
+                                                    <div className="feed-paused-overlay">
+                                                        <Activity size={40} opacity={0.3} />
+                                                        <p>Live Monitoring Paused</p>
+                                                    </div>
+                                                )}
 
                                                 {/* On-Feed HUD Overlay */}
                                                 <div className="feed-hud">
