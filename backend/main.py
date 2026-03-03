@@ -46,43 +46,8 @@ def health():
 # Set to 0 for real webcam.
 def detect_cameras():
     """Detects available hardware cameras with friendly names on Windows."""
-    available = []
-    
-    # 1. Capture names using pygrabber on Windows
-    device_names = []
-    if os.name == 'nt' and FilterGraph:
-        try:
-            graph = FilterGraph()
-            device_names = graph.get_input_devices()
-        except Exception as e:
-            print(f"[System] Warning: Could not resolve camera names: {e}")
-            device_names = []
-
-    # 2. Scan cameras and match with names
-    for i in range(8): # Check up to 8 slots
-        try:
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW) if os.name == 'nt' else cv2.VideoCapture(i)
-            if cap.isOpened():
-                # Force standard resolution and MJPG format to prevent DirectShow decoding glitches
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                ret, _ = cap.read()
-                if ret:
-                    friendly_name = f"Camera {i}"
-                    if i < len(device_names):
-                        friendly_name = device_names[i]
-                    
-                    available.append({
-                        "id": i, 
-                        "name": f"{friendly_name.upper()} (SENSOR {i})"
-                    })
-                cap.release()
-        except Exception as e:
-            print(f"[System] Skipping camera {i}: {e}")
-            continue
-            
-    # Add demo source
+    # Hardcoded known good camera to avoid race conditions during re-init
+    available = [{"id": 0, "name": "USB2.0 HD UVC WEBCAM (SENSOR 0)"}]
     available.append({"id": "bus.mp4", "name": "SIMULATED CCTV (DEMO FILE)"})
     return available
 
@@ -261,23 +226,24 @@ def background_capture(token):
     """Background thread to capture from LIVE camera and process frames."""
     global last_frame, live_thread_token
     
-    is_file = isinstance(VIDEO_SOURCE, str) and not VIDEO_SOURCE.startswith('rtsp')
     print(f"[Live] Thread {token} active for source {VIDEO_SOURCE}")
     
     cap = None
     if isinstance(VIDEO_SOURCE, int) and os.name == 'nt':
+        # [CRITICAL] MJPG + 640x480 is the most stable bandwidth-safe profile for USB 2.0 Webcams
         cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_DSHOW)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            print(f"[Live] Hardware camera initialized.")
+            print(f"[Live] Hardware camera 0 initialized (MJPG/640x480).")
+            # Clear buffer
+            for _ in range(15): cap.read()
     else:
         cap = cv2.VideoCapture(VIDEO_SOURCE)
-        if isinstance(VIDEO_SOURCE, int) and cap.isOpened():
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+    if isinstance(VIDEO_SOURCE, int) and cap is not None and cap.isOpened():
+        print(f"[Live] Hardware camera ready.")
     
     is_file = not isinstance(VIDEO_SOURCE, int)
     
@@ -311,16 +277,12 @@ def background_capture(token):
                 if isinstance(VIDEO_SOURCE, int) and os.name == 'nt':
                     print(f"[Debug] Attempting cv2.VideoCapture({VIDEO_SOURCE}, DSHOW)...")
                     cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_DSHOW)
-                else:
-                    print(f"[Debug] Attempting cv2.VideoCapture({VIDEO_SOURCE})...")
-                    cap = cv2.VideoCapture(VIDEO_SOURCE)
-                
-                # [CRITICAL FIX] Force resolution and MJPG to prevent DSHOW byte-stride / MJPEG decoding corruption
-                if isinstance(VIDEO_SOURCE, int):
                     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                
+                else:
+                    print(f"[Debug] Attempting cv2.VideoCapture({VIDEO_SOURCE})...")
+                    cap = cv2.VideoCapture(VIDEO_SOURCE)
                 print("[Live] Camera hardware re-initialized.")
             except Exception as e:
                 print(f"[Critical] VideoCapture Exception: {e}")
