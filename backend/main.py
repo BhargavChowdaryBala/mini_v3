@@ -45,9 +45,28 @@ def health():
 # For demo purposes, we use bus.mp4 as the default "Live" source. 
 # Set to 0 for real webcam.
 def detect_cameras():
-    """Detects available hardware cameras with friendly names on Windows."""
-    # Hardcoded known good camera to avoid race conditions during re-init
-    available = [{"id": 0, "name": "USB2.0 HD UVC WEBCAM (SENSOR 0)"}]
+    """Detects available hardware cameras using pygrabber (DirectShow) on Windows."""
+    available = []
+    
+    # 1. Capture names using pygrabber on Windows (Safe, doesn't open stream)
+    device_names = []
+    if os.name == 'nt' and FilterGraph:
+        try:
+            graph = FilterGraph()
+            device_names = graph.get_input_devices()
+            for i, name in enumerate(device_names):
+                available.append({
+                    "id": i, 
+                    "name": f"{name.upper()} (SENSOR {i})"
+                })
+        except Exception as e:
+            print(f"[System] Warning: Could not resolve camera names: {e}")
+            
+    # Fallback if pygrabber fails or no cameras found
+    if not available:
+        available = [{"id": 0, "name": "USB2.0 HD UVC WEBCAM (SENSOR 0)"}]
+            
+    # Add demo source
     available.append({"id": "bus.mp4", "name": "SIMULATED CCTV (DEMO FILE)"})
     return available
 

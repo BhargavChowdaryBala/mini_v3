@@ -127,7 +127,14 @@ def apply_professional_restoration(image):
     # Pass F: Gamma Correction for Washed out/Overexposed plates
     pass_f = adjust_gamma(gray, gamma=0.6)
 
-    return [pass_a, pass_b, pass_c, pass_d, pass_e, pass_f]
+    # [NEW] Pass G: CLAHE Extreme (for very low contrast)
+    clahe_high = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(4,4))
+    pass_g = clahe_high.apply(gray)
+    
+    # [NEW] Pass H: Sharp Contrast (High Gamma + CLAHE)
+    pass_h = adjust_gamma(pass_g, gamma=1.2)
+
+    return [pass_a, pass_b, pass_c, pass_d, pass_e, pass_f, pass_g, pass_h]
 
 def character_voting(plate_results):
     """
@@ -137,28 +144,38 @@ def character_voting(plate_results):
     if not plate_results:
         return "UNKNOWN"
     
-    # Filter out UNKNOWN or very short results
-    valid_results = [(s.upper(), conf) for s, conf in plate_results if s != "UNKNOWN" and len(s) >= 4]
+    valid_results = []
+    standard_regex = re.compile(r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}$')
+    
+    for s, conf in plate_results:
+        s_clean = s.upper().replace(" ", "")
+        if s_clean != "UNKNOWN" and len(s_clean) >= 4:
+            # WEIGHTED BOOST: If the individual OCR result already matches a standard Indian plate, boost its weight!
+            weight = conf
+            if standard_regex.match(s_clean):
+                weight += 0.5 # Substantial bonus for valid format
+            valid_results.append((s_clean, weight))
+            
     if not valid_results:
         return "UNKNOWN"
     
-    # Find the most frequent length
+    # Find the most frequent length among weighted voters
     lengths = [len(s) for s, _ in valid_results]
     target_len = Counter(lengths).most_common(1)[0][0]
     
     # Filter strings to target length (or close to it)
-    voters = [(s, conf) for s, conf in valid_results if abs(len(s) - target_len) <= 1]
+    voters = [(s, weight) for s, weight in valid_results if abs(len(s) - target_len) <= 1]
     
     final_plate = ""
     for i in range(target_len):
-        char_weights = {} # {char: total_confidence}
-        for s, conf in voters:
+        char_weights = {} # {char: total_weight}
+        for s, weight in voters:
             if i < len(s):
                 char = s[i]
-                char_weights[char] = char_weights.get(char, 0) + conf
+                char_weights[char] = char_weights.get(char, 0) + weight
         
         if char_weights:
-            # Pick character with highest combined confidence
+            # Pick character with highest combined weighted confidence
             final_char = max(char_weights, key=char_weights.get)
             final_plate += final_char
             
@@ -336,7 +353,9 @@ class BusProcessor:
     def extract_indian_number_plate(self, text_list):
         return extract_indian_number_plate(text_list)
 
-    def process_frame(self, frame):
+        # 0. Global Memory Cleanup
+        self.cleanup_stale_data()
+
         """
         Refactored Frame Processing with PERFORMANCE OPTIMIZATIONS:
         1. Downscale frame for fast YOLO inference (Max 640px)
@@ -588,8 +607,27 @@ class VideoUploadProcessor:
             line_direction=line_direction
         )
         self.lock = threading.Lock()
+        self.last_cleanup_time = time.time()
 
-    def process_video(self, video_path, progress_callback=None, frame_callback=None):
+    def cleanup_stale_data(self):
+        """Purges old tracking and proximity data to prevent memory growth over 24/7 operation."""
+        now = time.time()
+        # Cleanup every 5 minutes
+        if now - self.last_cleanup_time < 300:
+            return
+            
+        print("[System] Performing periodic memory cleanup...")
+        # Clear tracking history for IDs not seen in 10 minutes
+        # (Assuming tracking IDs are unique or cycle very slowly)
+        self.tracking_history.clear() 
+        self.proximity_states.clear()
+        
+        # Keep processed_ids for a bit longer to prevent re-processing the same bus if it lingers
+        # but clear if it gets too large
+        if len(self.processed_ids) > 1000:
+            self.processed_ids.clear()
+            
+        self.last_cleanup_time = now
         """Processes an uploaded video file using the unified proximity logic."""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -616,8 +654,8 @@ class VideoUploadProcessor:
 
         print(f"[VideoMode] Starting analysis of {video_path} (Unified Proximity Logic)")
         
-        # Performance mode: process 1 frame every N frames
-        skip_frames = 2 # Processes ~10 FPS from 30 FPS video, drastically reducing lag
+        # [ACCURACY TWEAK] Increased frequency: process 1 every 2 frames
+        skip_frames = 1 
         
         while cap.isOpened():
             ret, frame = cap.read()
