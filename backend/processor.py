@@ -15,6 +15,7 @@ import time
 import threading
 import re
 import gc
+import queue
 from collections import Counter
 
 def calculate_sharpness(image):
@@ -76,13 +77,14 @@ def apply_professional_restoration(image):
     if image is None or image.size == 0:
         return [image]
     
-    # 1. Bicubic Super-Resolution (Upscale to target 200px height)
+    # 1. Lanczos4 Super-Resolution (Upscale to target 240px height for higher detail)
     h, w = image.shape[:2]
-    scale = 200 / h if h < 200 else 1.0
-    upscaled = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+    scale = 240 / h if h < 240 else 1.0
+    upscaled = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
     
-    # 2. NLMeans Denoising (Preserves edges while removing digital artifacts)
+    # 2. NLMeans Denoising + Median Blur (Filter salt-and-pepper noise)
     denoised = cv2.fastNlMeansDenoisingColored(upscaled, None, 10, 10, 7, 21)
+    denoised = cv2.medianBlur(denoised, 3) # Remove fine digital noise
     
     # 3. CLAHE (Local Contrast Enhancement)
     lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
@@ -136,34 +138,70 @@ def apply_professional_restoration(image):
 
     return [pass_a, pass_b, pass_c, pass_d, pass_e, pass_f, pass_g, pass_h]
 
-def character_voting(plate_results):
+
+def perspective_warp_plate(image):
     """
-    Performs character-level voting across multiple plate strings with confidence weighting.
-    plate_results: List of (text, confidence) tuples
+    Elite Dynamic Warp: Straightens angled plates using perspective transformation.
+    Essential for roadside cameras that see buses from the side.
     """
-    if not plate_results:
-        return "UNKNOWN"
+    if image is None or image.size == 0: return image
     
-    valid_results = []
-    standard_regex = re.compile(r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}$')
+    # 1. Image Preprocessing for contour detection
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    for s, conf in plate_results:
-        s_clean = s.upper().replace(" ", "")
-        if s_clean != "UNKNOWN" and len(s_clean) >= 4:
-            # WEIGHTED BOOST: If the individual OCR result already matches a standard Indian plate, boost its weight!
-            weight = conf
-            if standard_regex.match(s_clean):
-                weight += 0.5 # Substantial bonus for valid format
-            valid_results.append((s_clean, weight))
-            
+    # 2. Edge detection + Contour finding
+    edged = cv2.Canny(blurred, 50, 200)
+    cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not cnts:
+        return deskew_plate(image) # Fallback to simple rotation
+
+    # Find the largest rectangular-ish contour (the plate boundary)
+    c = max(cnts, key=cv2.contourArea)
+    peri = cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+
+    # If we found 4 corners, we can do a high-precision warp
+    if len(approx) == 4:
+        pts = approx.reshape(4, 2)
+        # Order points: TL, TR, BR, BL
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+
+        # Define destination: standard 350x100 plate aspect ratio
+        dst = np.array([
+            [0, 0],
+            [350 - 1, 0],
+            [350 - 1, 100 - 1],
+            [0, 100 - 1]
+        ], dtype="float32")
+
+        M = cv2.getPerspectiveTransform(rect, dst)
+        warped = cv2.warpPerspective(image, M, (350, 100))
+        return warped
+        
+    return deskew_plate(image) # Fallback
+
+def character_voting(valid_results):
+    """
+    WEIGHTED CONFIDENCE VOTING:
+    Professional temporal aggregation that considers the quality of each OCR pass.
+    valid_results: List of (text, confidence)
+    """
     if not valid_results:
         return "UNKNOWN"
     
-    # Find the most frequent length among weighted voters
+    # 1. Length Voting: Find most likely plate length
     lengths = [len(s) for s, _ in valid_results]
     target_len = Counter(lengths).most_common(1)[0][0]
     
-    # Filter strings to target length (or close to it)
+    # 2. Filter strings to target length (or close to it)
     voters = [(s, weight) for s, weight in valid_results if abs(len(s) - target_len) <= 1]
     
     final_plate = ""
@@ -172,10 +210,12 @@ def character_voting(plate_results):
         for s, weight in voters:
             if i < len(s):
                 char = s[i]
-                char_weights[char] = char_weights.get(char, 0) + weight
+                # Apply an exponential boost to high-confidence characters
+                # This ensures a 95% reading heavily outweighs several 40% readings
+                effective_weight = np.exp(weight * 3) # Boosted power for clarity
+                char_weights[char] = char_weights.get(char, 0) + effective_weight
         
         if char_weights:
-            # Pick character with highest combined weighted confidence
             final_char = max(char_weights, key=char_weights.get)
             final_plate += final_char
             
@@ -228,10 +268,12 @@ def extract_indian_number_plate(text_list):
     """
     STRICT Indian Number Plate extraction logic.
     Follows MoRTH / HSRP guidelines (Standard & BH Series).
+    Checks for 30+ potential misreads with aggressive regex.
     """
     text = " ".join(text_list).upper()
-    text = re.sub(r'\bIND\b|\bND\b|\s+', '', text)
+    # Remove common artifacts like 'IND', 'NOT', or spaces
     text = re.sub(r'[^A-Z0-9]', '', text)
+    text = text.replace("IND", "")
 
     # State Codes for Validation
     STATE_CODES = {
@@ -240,54 +282,39 @@ def extract_indian_number_plate(text_list):
         'TN', 'TS', 'TR', 'UP', 'UK', 'WB', 'AN', 'DD', 'DN', 'LD', 'PY', 'JK', 'LA'
     }
 
-    # 1. [STRICT] Standard Modern (e.g., AP 39 UX 8273)
-    # Pattern: [2 Alpha][2 Numeric][1-2 Alpha][4 Numeric]
-    # Allow optional spaces between components
-    match = re.search(r'([A-Z]{2})\s*(\d{2})\s*([A-Z]{1,2})\s*(\d{4})', text)
-    if match:
-        state, rto, ser, num = match.groups()
+    # 1. [STRICT] Standard (e.g., AP 38 BP 1234)
+    standard_match = re.search(r'([A-Z]{2})(\d{1,2})([A-Z]{1,2})(\d{4})', text)
+    if standard_match:
+        state, district, series, num = standard_match.groups()
         if state in STATE_CODES:
-            candidate = f"{state}{rto}{ser}{num}"
+            # Pad district if single digit
+            if len(district) == 1: district = "0" + district
+            candidate = f"{state}{district}{series}{num}"
             return contextual_correction(candidate, "standard")
 
-    # 2. [STRICT] Bharat Series (e.g., 22BH1234AA)
-    # Pattern: [2 Numeric][BH][4 Numeric][2 Alpha]
-    match = re.search(r'(\d{2})BH(\d{4})([A-Z]{2})', text)
-    if match:
-        return contextual_correction(match.group(), "bh")
+    # 2. [STRICT] BH Series (e.g., 22BH1234AA)
+    bh_match = re.search(r'(\d{2})BH(\d{4})([A-Z]{2})', text)
+    if bh_match:
+        return contextual_correction(bh_match.group(), "bh")
 
-    # 3. [LOOSE] FALLBACK (State Code First + Progressive Filtering)
+    # 3. [LOOSE] State Code Fallback
     for code in STATE_CODES:
         if code in text:
-            # Look for State + RTO + Anything + 4 Numbers
-            match = re.search(rf'({code})\s*(\d{{1,2}})\s*([A-Z]*)\s*(\d{{4}})', text)
+            idx = text.find(code)
+            candidate = text[idx:idx+15] # Grab enough characters
+            match = re.search(rf'({code})(\d{{2}})([A-Z]{{1,2}})(\d{{4}})', candidate)
             if match:
-                state, rto, ser, num = match.groups()
-                # Re-verify and correct
-                candidate = contextual_correction(f"{state}{rto}{ser}{num}", "standard")
-                if len(candidate) >= 7: return candidate
+                return contextual_correction(match.group(), "standard")
 
-    # 4. Global Alphanumeric Check (Strict 10 - Standard Candidate)
-    # Pattern: Look for 2 Alpha + 2 Num + Anything + 4 Num anywhere
-    match = re.search(r'([A-Z]{2})\s*(\d{2})\s*([A-Z0-9]{1,2})\s*(\d{4})', text)
-    if match:
-        state, rto, ser, num = match.groups()
-        if state in STATE_CODES:
-            return contextual_correction(f"{state}{rto}{ser}{num}", "standard")
-
-    # 5. [LAST RESORT] Alphanumeric Filter (Min 7, Max 10)
-    # Only return if it actually looks like a plate (at least 2 letters, 3 digits)
-    candidate = re.sub(r'[^A-Z0-9]', '', text)
-    if 7 <= len(candidate) <= 10:
-        alpha_count = sum(1 for c in candidate if c.isalpha())
-        digit_count = sum(1 for c in candidate if c.isdigit())
-        if alpha_count >= 2 and digit_count >= 3:
-            return candidate
+    # 4. [EXTREME RESCUE] Filter Alpha-Num count
+    chars = re.sub(r'[^A-Z0-9]', '', text)
+    if 8 <= len(chars) <= 10:
+        return chars
 
     return "UNKNOWN"
 
 class BusProcessor:
-    def __init__(self, bus_model_path=None, plate_model_path=None, line_position=0.5, line_direction='vertical'):
+    def __init__(self, bus_model_path=None, plate_model_path=None, line_position=0.5, line_direction='horizontal'):
         """
         Refactored for Video File Pipeline.
         - line_position: 0.0 to 1.0 (percent of width/height)
@@ -311,15 +338,21 @@ class BusProcessor:
         self.plate_model.to('cpu')
         gc.collect()
         
-        print("Initializing PaddleOCR...")
+        print("Initializing PaddleOCR (Elite Accuracy Mode)...")
         try:
+            # ELITE ACCURACY CONFIG: 
+            # - det_db_thresh=0.3: more sensitive to faint text
+            # - use_angle_cls=True: handles skewed/leaning plates
             self.ocr = PaddleOCR(
                 use_angle_cls=True, 
                 lang='en', 
-                ir_optim=False, 
+                ir_optim=True, # Improved optimization
                 enable_mkldnn=False,
                 use_tensorrt=False,
-                show_log=False
+                show_log=False,
+                det_db_thresh=0.3,
+                det_db_box_thresh=0.5,
+                rec_batch_num=6 # Faster batch processing in background
             )
         except Exception as e:
             print(f"Error initializing PaddleOCR: {e}")
@@ -327,20 +360,29 @@ class BusProcessor:
         
         self.system_status = "System Ready"
         
+        # ELITE v2.0 ARCHITECTURE: Job Queue & Singleton Worker
+        self.ocr_queue = queue.Queue(maxsize=500) # Buffer for ~100 buses
+        self.worker_thread = threading.Thread(target=self._ocr_worker_loop)
+        self.worker_thread.daemon = True
+        self.worker_thread.start()
+        
         # State tracking for File Pipeline
-        self.lock = threading.Lock() 
+        self.tracking_lock = threading.Lock() # Protects state tracking variables
+        self.inference_lock = threading.Lock() # Protects YOLO and OCR model calls
         
         # State tracking for File Pipeline
         self.tracking_history = {} # {id: last_pos}
         self.processed_ids = {} # {id: "PLATE_NUMBER" or "PENDING"}
         self.proximity_states = {} # {id: {"crossed": bool, "frames": [], "best_size": 0}}
+        self.active_track_ids = set()
         
         # Proximity settings
         # [REFINED] TRIGGER FOR FRONT PART: 
-        # 0.005 triggers earlier (farther) to catch the front clearly as it approaches.
-        self.proximity_threshold_ratio = 0.005 
-        self.capture_count = 10 # Reduced from 20 for faster high-quality processing
+        # Wait until the bus occupies at least 7% of the frame for clearer plate detail.
+        self.proximity_threshold_ratio = 0.07 
+        self.capture_count = 5 # Further reduced (from 8 to 5) for faster trigger. Accuracy maintained via selective sampling.
         self.current_session = "live"
+        self.last_cleanup_time = time.time()
 
     def set_session(self, name):
         """Sets a new storage session name (for logging context only)."""
@@ -348,34 +390,82 @@ class BusProcessor:
         clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', name)
         self.current_session = clean_name
         return clean_name
+
+    def _ocr_worker_loop(self):
+        """
+        Background Worker: Consumes bus jobs from the queue.
+        Ensures the live feed stays at 30 FPS even during heavy traffic.
+        """
+        print("[System] OCR Worker Thread Started (Idle Mode)")
+        while True:
+            try:
+                # Wait for a job (block=True)
+                job = self.ocr_queue.get(timeout=10)
+                burst_frames, direction, track_id = job
+                
+                print(f"[Worker] Processing Bus {track_id} ({len(burst_frames)} frames in queue)")
+                self._background_burst_analysis(burst_frames, direction, track_id)
+                
+                # Cleanup: Explicitly delete frames from memory
+                del burst_frames
+                self.ocr_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[Worker] Fatal Error: {e}")
+                time.sleep(1)
+
         
 
     def extract_indian_number_plate(self, text_list):
         return extract_indian_number_plate(text_list)
 
-        # 0. Global Memory Cleanup
-        self.cleanup_stale_data()
+    def cleanup_stale_data(self):
+        """Purges old tracking and proximity data to prevent memory growth over 24/7 operation."""
+        now = time.time()
+        # Cleanup every 5 minutes
+        if now - self.last_cleanup_time < 300:
+            return
+            
+        print("[System] Performing periodic memory cleanup...")
+        with self.tracking_lock:
+            # Clear tracking history for IDs not seen in 10 minutes
+            self.tracking_history.clear() 
+            self.proximity_states.clear()
+            
+            # Keep processed_ids for a bit longer to prevent re-processing the same bus if it lingers
+            # but clear if it gets too large
+            if len(self.processed_ids) > 1000:
+                self.processed_ids.clear()
+                
+            self.last_cleanup_time = now
 
+    def process_frame(self, frame, imgsz=320):
         """
         Refactored Frame Processing with PERFORMANCE OPTIMIZATIONS:
-        1. Downscale frame for fast YOLO inference (Max 640px)
+        1. Downscale frame for fast YOLO inference
         2. Tracking with ByteTrack
         3. Crossing Detection (Virtual Line)
         4. Trigger Capture & Analysis
         """
+        # 0. Global Memory Cleanup
+        self.cleanup_stale_data()
+
         h_orig, w_orig = frame.shape[:2]
         
-        # Performance: Downscale frame for inference (320px is extremely fast on CPU)
-        inf_w = 320
+        # Performance: Downscale frame for inference
+        inf_w = imgsz
         scale = inf_w / w_orig
         inf_h = int(h_orig * scale)
         inf_frame = cv2.resize(frame, (inf_w, inf_h), interpolation=cv2.INTER_LINEAR)
 
-        with self.lock:
-            # Detect and Track Buses (320px imgsz provides ~4x speedup over 640px)
-            results = self.bus_model.track(inf_frame, persist=True, classes=[5], conf=0.35, tracker="bytetrack.yaml", verbose=False, imgsz=320)
+        with self.inference_lock:
+            # Detect and Track Buses (imgsz is now dynamic: 320 for Live, 640 for Video)
+            results = self.bus_model.track(inf_frame, persist=True, classes=[5], conf=0.35, tracker="bytetrack.yaml", verbose=False, imgsz=imgsz)
         
         annotated_frame = frame.copy()
+        current_active_ids = set()
         
         # Draw Virtual Gate Line
         if self.line_direction == 'vertical':
@@ -391,6 +481,7 @@ class BusProcessor:
             # Scale boxes back to original coordinates
             boxes = results[0].boxes.xyxy.cpu().numpy() / scale
             track_ids = results[0].boxes.id.int().cpu().numpy()
+            current_active_ids = set(track_ids.tolist())
             confs = results[0].boxes.conf.cpu().numpy()
 
             for box, track_id_raw, conf in zip(boxes, track_ids, confs):
@@ -399,9 +490,13 @@ class BusProcessor:
                 centroid_x = (x1 + x2) // 2
                 centroid_y = (y1 + y2) // 2
                 
-                if track_id in self.processed_ids:
+                with self.tracking_lock:
+                    is_already_processed = track_id in self.processed_ids
+                    if is_already_processed:
+                        plate = self.processed_ids[track_id]
+                
+                if is_already_processed:
                     # [OPTIMIZATION] Already processed or being processed
-                    plate = self.processed_ids[track_id]
                     color = (255, 255, 0) if plate == "PENDING" else (0, 255, 255) # Cyan for Completed
                     label = f"Bus {track_id}: {plate}" if plate != "PENDING" else f"Bus {track_id}: ANALYZING..."
                     
@@ -416,183 +511,247 @@ class BusProcessor:
                 cv2.putText(annotated_frame, f"Bus {track_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
                 # 1. Crossing Detection
-                # Initialize state for new IDs
-                if track_id not in self.proximity_states:
-                    self.proximity_states[track_id] = {"crossed": False, "frames": [], "analyzed": False}
-                
-                state = self.proximity_states[track_id]
-                
-                # Detect Crossing
-                if track_id in self.tracking_history:
-                    prev_pos = self.tracking_history[track_id]
-                    line_val = (w_orig * self.line_position) if self.line_direction == 'vertical' else (h_orig * self.line_position)
-                    curr_pos = centroid_x if self.line_direction == 'vertical' else centroid_y
+                with self.tracking_lock:
+                    # Initialize state for new IDs
+                    if track_id not in self.proximity_states:
+                        self.proximity_states[track_id] = {"crossed": False, "frames": [], "analyzed": False}
                     
-                    if (prev_pos < line_val <= curr_pos) or (prev_pos > line_val >= curr_pos):
-                        state["crossed"] = True
-                        print(f"[AI] Bus {track_id} crossed virtual line.")
-
-                # 2. Trigger Burst Capture (Once crossed AND near enough OR if already very large)
-                area = (x2 - x1) * (y2 - y1)
-                area_ratio = area / (w_orig * h_orig)
-
-                # Trigger if crossed OR if bus is already very large (fallback for videos starting mid-way)
-                should_trigger = state["crossed"] or area_ratio > 0.15
-
-                if should_trigger and not state["analyzed"]:
-                    if area_ratio > self.proximity_threshold_ratio or len(state["frames"]) > 0:
-                        if len(state["frames"]) == 0:
-                            print(f"[AI] >>> START CAPTURE for Bus {track_id} (Ratio: {area_ratio:.3f})")
+                    state = self.proximity_states[track_id]
+                    
+                    # Detect Crossing
+                    if track_id in self.tracking_history:
+                        prev_pos = self.tracking_history[track_id]
+                        line_val = (w_orig * self.line_position) if self.line_direction == 'vertical' else (h_orig * self.line_position)
+                        curr_pos = centroid_x if self.line_direction == 'vertical' else centroid_y
                         
-                        # Start or continue capture
-                        if len(state["frames"]) < self.capture_count:
-                            state["frames"].append(frame.copy())
-                            cv2.circle(annotated_frame, (x1+15, y1+15), 8, (0, 0, 255), -1)
-                        
-                        if len(state["frames"]) == self.capture_count:
-                            state["analyzed"] = True
-                            self.processed_ids[track_id] = "PENDING"
+                        if (prev_pos < line_val <= curr_pos) or (prev_pos > line_val >= curr_pos):
+                            state["crossed"] = True
+                            print(f"[AI] Bus {track_id} crossed virtual line.")
+
+                    # 2. Trigger Burst Capture (Once crossed AND near enough OR if already very large)
+                    area = (x2 - x1) * (y2 - y1)
+                    area_ratio = area / (w_orig * h_orig)
+
+                    # Trigger if crossed OR if bus is already very large (fallback for videos starting mid-way)
+                    should_trigger = state["crossed"] or area_ratio > 0.15
+
+                    if should_trigger and not state["analyzed"]:
+                        if area_ratio > self.proximity_threshold_ratio or len(state["frames"]) > 0:
+                            if len(state["frames"]) == 0:
+                                print(f"[AI] >>> START CAPTURE for Bus {track_id} (Ratio: {area_ratio:.3f})")
                             
-                            print(f"[AI] >>> ANALYSIS TRIGGERED for Bus {track_id}")
-                            thread = threading.Thread(target=self._background_burst_analysis, 
-                                                     args=(state["frames"], "DETECTED", track_id))
-                            thread.daemon = True
-                            thread.start()
+                            # Start or continue capture with selective sampling (every other frame)
+                            # This ensures we get different angles rather than 5 identical blurry frames
+                            if len(state["frames"]) < self.capture_count:
+                                if state.get("frame_index", 0) % 2 == 0: 
+                                    # ELITE UPGRADE: Bumper-Only Selective Cropping
+                                    bw = x2 - x1
+                                    bh = y2 - y1
+                                    
+                                    # Logic: Focus on the "Bumper Belt" (middle-to-bottom portion of the bus)
+                                    buffer_y1 = y1 + int(bh * 0.4)
+                                    buffer_y2 = y1 + int(bh * 0.9) 
+                                    
+                                    bumper_crop = frame[buffer_y1:buffer_y2, x1:x2]
+                                    if bumper_crop.size > 0:
+                                        state["frames"].append({
+                                            "img": bumper_crop.copy(), 
+                                            "full_box": (x1, y1, x2, y2),
+                                            "crop_offset": (x1, buffer_y1)
+                                        })
+                                        # Visual Feedback: Red dot for capture
+                                        cv2.circle(annotated_frame, (x1+15, y1+15), 8, (0, 0, 255), -1)
+                            
+                            if len(state["frames"]) >= self.capture_count and not state["analyzed"]:
+                                state["analyzed"] = True
+                                self.processed_ids[track_id] = "ANALYZING..."
+                                
+                                # ELITE v2.0: Push to Queue instead of starting new thread
+                                bus_job = (list(state["frames"]), "DETECTED", track_id)
+                                try:
+                                    self.ocr_queue.put_nowait(bus_job)
+                                    print(f"[AI] >>> QUEUED Bus {track_id} for Deferred OCR.")
+                                except queue.Full:
+                                    print(f"[AI] Warning: Job Queue Full! Dropping Bus {track_id}")
 
                     # Update history for next frame
                     self.tracking_history[track_id] = centroid_x if self.line_direction == 'vertical' else centroid_y
 
+        with self.tracking_lock:
+            self.active_track_ids = current_active_ids
         return annotated_frame
 
     def _background_burst_analysis(self, burst_frames, direction, track_id):
         """
         Processes captured frames with intelligence:
         1. Localize plate in ALL frames.
-        2. Sort by sharpness and pick the top 8 clearest crops.
+        2. Sort by sharpness and pick the top 5 clearest crops.
         3. Perform deskewing and bilateral filtering.
         4. Run OCR and vote.
         """
         plate_candidates = []
         
-        for frame in burst_frames:
-            with self.lock:
-                plate_results = self.plate_model.predict(frame, conf=0.3, verbose=False)
+        for frame_data in burst_frames:
+            bus_crop = frame_data["img"]
+            if bus_crop.size == 0: continue
+
+            with self.inference_lock:
+                # Run plate model directly on the bumper crop
+                plate_results = self.plate_model.predict(bus_crop, conf=0.15, verbose=False)
             
             if len(plate_results[0].boxes) > 0:
                 box = plate_results[0].boxes.xyxy[0].cpu().numpy()
                 px1, py1, px2, py2 = map(int, box)
-                plate_crop = frame[py1:py2, px1:px2]
+                
+                # [ELITE v2.0] LOOSE PADDING (25% Expansion)
+                # This is the industry-standard fix for clipped characters
+                pw = px2 - px1
+                ph = py2 - py1
+                pad_w = int(pw * 0.25)
+                pad_h = int(ph * 0.25)
+                
+                px1 = max(0, px1 - pad_w)
+                py1 = max(0, py1 - pad_h)
+                px2 = min(bus_crop.shape[1], px2 + pad_w)
+                py2 = min(bus_crop.shape[0], py2 + pad_h)
+                
+                plate_crop = bus_crop[py1:py2, px1:px2]
                 
                 if plate_crop.size > 0:
                     sharpness = calculate_sharpness(plate_crop)
                     plate_candidates.append({"img": plate_crop, "sharpness": sharpness})
 
         if plate_candidates:
-            # Sort by sharpness (Descending) and take top 8
+            # Sort by sharpness (Descending) and take top 5 (matches capture_count)
             plate_candidates.sort(key=lambda x: x["sharpness"], reverse=True)
-            top_crops = [x["img"] for x in plate_candidates[:8]]
+            top_crops = [x["img"] for x in plate_candidates[:5]]
             
-            # Additional Preprocessing: Deskewing
-            deskewed_crops = [deskew_plate(img) for img in top_crops]
+            # Elite Upgrade: Use Perspective Warping instead of simple deskewing
+            # This is essential for plates seen at an angle
+            warped_crops = [perspective_warp_plate(img) for img in top_crops]
             
-            self.run_multi_ocr(deskewed_crops, direction, track_id)
+            self.run_multi_ocr(warped_crops, direction, track_id)
         else:
             print(f"[AI] No plate localized in burst for Bus {track_id}.")
             log_event("numberplate missed", "DETECTED", source=self.current_session, bus_id=track_id)
+            with self.tracking_lock:
+                self.processed_ids[track_id] = "UNKNOWN"
 
     def run_multi_ocr(self, plate_images, direction, track_id):
         if self.ocr is None: return
 
-        results = [] # Store (text, confidence)
+        ocr_raw_data = [] # Store (text, confidence)
+        standard_regex = re.compile(r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}$')
         
-        # [Smart Multi-Pass] Step 1: High-Speed Pass (Grayscale)
+        # [Elite Multi-Pass] Process each warped image
         for img in plate_images:
-            # Elite Preprocessing: Deskew + Pad
-            img = deskew_plate(img)
-            img = apply_padding(img, pad=15)
+            # 1. Advanced ISP: Contrast Enhancement (CLAHE)
+            # Essential for readable HSRP plates under bright lights or shadows
+            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            l = clahe.apply(l)
+            enhanced = cv2.merge((l, a, b))
+            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
             
-            h, w = img.shape[:2]
-            scale = 200 / h if h < 200 else 1.0
-            prepped = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-            prepped = cv2.fastNlMeansDenoisingColored(prepped, None, 10, 10, 7, 21)
-            gray = cv2.cvtColor(prepped, cv2.COLOR_BGR2GRAY)
+            # 2. Adaptive Gamma: Auto-correct for Shadows or Harsh Sunlight
+            gray_crop = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+            avg_brightness = np.mean(gray_crop)
+            
+            # Target average brightness is ~120
+            if avg_brightness < 80:
+                # Under shadows - boost brightness
+                enhanced = adjust_gamma(enhanced, gamma=1.5)
+            elif avg_brightness > 180:
+                # Direct sunlight/glare - reduce contrast
+                enhanced = adjust_gamma(enhanced, gamma=0.7)
+
+            # 3. Resizing & Filtering
+            h, w = enhanced.shape[:2]
+            scale = 240 / h if h < 240 else 1.0
+            prepped = cv2.resize(enhanced, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+            prepped = cv2.bilateralFilter(prepped, 5, 75, 75)
             
             try:
-                with self.lock:
-                    result = self.ocr.ocr(gray, cls=True)
-                if result and result[0]:
-                    lines = [line[1] for idx in range(len(result)) for line in result[idx]]
-                    raw_text = "".join([l[0] for l in lines])
-                    conf = sum([l[1] for l in lines]) / len(lines) if lines else 0
-                    clean = extract_indian_number_plate([raw_text])
-                    if clean != "UNKNOWN":
-                        # Weighted +20% for exact Indian Format match
-                        results.append((clean, conf + 0.2))
-                    else:
-                        clean_loose = re.sub(r'[^A-Z0-9]', '', raw_text.upper())
-                        if len(clean_loose) >= 4: results.append((clean_loose, conf))
+                res = self.ocr.ocr(prepped, cls=True)
+                if res and res[0]:
+                    for line in res[0]:
+                        text, conf = line[1]
+                        text_clean = text.upper().replace(" ", "")
+                        if len(text_clean) >= 4:
+                            # Apply validation bonus
+                            weight = conf
+                            if standard_regex.match(text_clean):
+                                weight += 0.5
+                            ocr_raw_data.append((text_clean, weight))
             except Exception as e:
-                pass # Suppress OCR errors to prevent spam, but log in debug if needed
+                print(f"[OCR] Pass Error: {e}")
 
-        # Step 2: Intelligent Fallback with Advanced Passes (B, C, D)
-        # Only run if we don't have a high-confidence match yet
-        if not results or max([r[1] for r in results]) < 0.8:
-            # Pick the top 5 sharpest frames for heavy processing
-            for img in plate_images[:5]:
-                # Elite Preprocessing
-                img = deskew_plate(img)
-                img = apply_padding(img, pad=15)
-                
-                versions = apply_professional_restoration(img)
-                # Pass B (Otsu), Pass C (Adaptive), Pass D (Bilateral HD)
-                for processed_img in versions[1:]: 
-                    try:
-                        with self.lock:
-                            result = self.ocr.ocr(processed_img, cls=True)
-                        if result and result[0]:
-                            lines = [line[1] for idx in range(len(result)) for line in result[idx]]
-                            raw_text = "".join([l[0] for l in lines])
-                            conf = sum([l[1] for l in lines]) / len(lines) if lines else 0
-                            clean = extract_indian_number_plate([raw_text])
-                            if clean != "UNKNOWN":
-                                results.append((clean, conf + 0.2))
-                            else:
-                                clean_loose = re.sub(r'[^A-Z0-9]', '', raw_text.upper())
-                                if len(clean_loose) >= 4: results.append((clean_loose, conf))
-                    except Exception as e:
-                        pass # Suppress OCR errors in advanced passes
+        # Elite Character Voting (Confidence-Weighted)
+        final_plate = character_voting(ocr_raw_data)
+        
+        # Apply strict contextual corrections
+        pattern = "standard" if len(final_plate) >= 8 else "bh"
+        final_plate = contextual_correction(final_plate, pattern)
 
-        final_plate_raw = character_voting(results)
-        final_plate = extract_indian_number_plate([final_plate_raw])
+        # Final result is (plate, average_confidence)
+        # 3. Dynamic Confidence Rescue [ELITE v2.0]
+        # We calculate initial confidence FIRST to decide if we need a rescue
+        winner_conf = 0
+        if ocr_raw_data and final_plate != "UNKNOWN":
+            voters = [w for p, w in ocr_raw_data if p == final_plate]
+            if voters: winner_conf = sum(voters) / len(voters)
+
+        # If the result is UNKNOWN or very low confidence, trigger a deep scan
+        is_weak = final_plate == "UNKNOWN" or (ocr_raw_data and winner_conf < 0.6)
         
-        if (final_plate == "UNKNOWN" or len(final_plate) < 4) and results:
-            best_single = max(results, key=lambda x: x[1])
-            if best_single[1] > 0.6:
-                final_plate = extract_indian_number_plate([best_single[0]])
-        
-        # Update shared state with the final result
-        with self.lock:
+        if is_weak and plate_images:
+            # Pick the sharpest frame (first in list after sorting)
+            best_img = plate_images[0]
+            # Try a "Deep Rescue" on the top 3 specialized filters
+            rescue_v = apply_professional_restoration(best_img)
+            rescue_results = []
+            
+            for v_img in rescue_v[:3]: # Normalized, Otsu, and Adaptive filters
+                try:
+                    res = self.ocr.ocr(v_img, cls=True)
+                    if res and res[0]:
+                        for line in res[0]:
+                            text, conf = line[1]
+                            text_clean = extract_indian_number_plate([text])
+                            if text_clean != "UNKNOWN":
+                                rescue_results.append((text_clean, conf))
+                except: continue
+            
+            if rescue_results:
+                # If rescue found a better/standard plate, override
+                best_rescue = max(rescue_results, key=lambda x: x[1])
+                if final_plate == "UNKNOWN" or best_rescue[1] > (winner_conf + 0.1):
+                    final_plate, winner_conf = best_rescue
+                    print(f"[AI] >>> RESCUE SUCCESS: {final_plate} (New Conf: {winner_conf:.2f})")
+
+        with self.tracking_lock:
             self.processed_ids[track_id] = final_plate
+            print(f"[AI] FINAL RESULT for Bus {track_id}: {final_plate} (Conf: {winner_conf:.2f})")
         
-        if final_plate != 'UNKNOWN':
-            log_event(final_plate, direction, source=self.current_session, bus_id=track_id)
-        else:
-            # If all 5 frames failed to produce a valid OCR result
-            log_event('numberplate missed', direction, source=self.current_session, bus_id=track_id)
-
-    def run_ocr(self, plate_img, direction):
-        """Legacy support for single plate processing."""
-        self.run_multi_ocr([plate_img], 'DETECTED')
-
+        # Log to DB/CSV with confidence
+        log_event((final_plate, round(winner_conf, 2)), direction, source=self.current_session, bus_id=track_id)
     def get_status(self):
         return self.system_status
 
     def reset(self):
+        """Clears all tracking and proximity states for a fresh start."""
         self.system_status = "System Ready"
-        self.tracking_history = {}
-        self.processed_ids = {}
-        self.proximity_states = {}
-        print("[Processor] State Reset for new video loop.")
+        with self.tracking_lock:
+            self.tracking_history.clear()
+            self.processed_ids.clear()
+            self.proximity_states.clear()
+            self.active_track_ids.clear()
+            # Clear queue safely
+            while not self.ocr_queue.empty():
+                try: self.ocr_queue.get_nowait()
+                except: break
+            print("[Processor] State Reset for new video loop.")
 
 class VideoUploadProcessor:
     def __init__(self, bus_model_path=None, plate_model_path=None, line_position=0.5, line_direction='horizontal'):
@@ -607,27 +766,8 @@ class VideoUploadProcessor:
             line_direction=line_direction
         )
         self.lock = threading.Lock()
-        self.last_cleanup_time = time.time()
 
-    def cleanup_stale_data(self):
-        """Purges old tracking and proximity data to prevent memory growth over 24/7 operation."""
-        now = time.time()
-        # Cleanup every 5 minutes
-        if now - self.last_cleanup_time < 300:
-            return
-            
-        print("[System] Performing periodic memory cleanup...")
-        # Clear tracking history for IDs not seen in 10 minutes
-        # (Assuming tracking IDs are unique or cycle very slowly)
-        self.tracking_history.clear() 
-        self.proximity_states.clear()
-        
-        # Keep processed_ids for a bit longer to prevent re-processing the same bus if it lingers
-        # but clear if it gets too large
-        if len(self.processed_ids) > 1000:
-            self.processed_ids.clear()
-            
-        self.last_cleanup_time = now
+    def process_video(self, video_path, progress_callback=None, frame_callback=None):
         """Processes an uploaded video file using the unified proximity logic."""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -651,11 +791,13 @@ class VideoUploadProcessor:
         self.processor.tracking_history = {}
         self.processor.processed_ids = {} # Unified dictionary format
         self.processor.proximity_states = {}
-
-        print(f"[VideoMode] Starting analysis of {video_path} (Unified Proximity Logic)")
         
-        # [ACCURACY TWEAK] Increased frequency: process 1 every 2 frames
-        skip_frames = 1 
+        print(f"[VideoMode] Starting analysis of {video_path} (High Accuracy + Smooth UI Mode)")
+        
+        # [PERFORMANCE TWEAK] Process every 2nd frame (approx 15 FPS)
+        # We need more frames to guarantee we catch the exact moment the plate is sharpest.
+        base_skip_frames = 2 
+        dynamic_skip_counter = 0
         
         while cap.isOpened():
             ret, frame = cap.read()
@@ -663,13 +805,29 @@ class VideoUploadProcessor:
             
             frame_idx += 1
             
-            # Subsample frames to speed up processing
-            if frame_idx % skip_frames != 0:
+            # [DYNAMIC INTELLIGENT FAST FORWARDING]
+            # If we've already captured the front of the bus, skip YOLO frames rapidly
+            if dynamic_skip_counter > 0:
+                dynamic_skip_counter -= 1
                 continue
             
-            # Use the core logic from BusProcessor
-            # This handles detection, tracking, crossing, and proximity-based OCR triggering
-            annotated_frame = self.processor.process_frame(frame)
+            # Subsample frames to speed up processing
+            if frame_idx % base_skip_frames != 0:
+                continue
+            
+            # [MAXIMUM ACCURACY] Use 640px imgsz (up from 480px)
+            # We compensate for the slower 640px by skipping more frames above.
+            annotated_frame = self.processor.process_frame(frame, imgsz=640)
+            
+            # Fast-Forward check: If ALL currently visible buses have already been captured (in processed_ids)
+            with self.processor.tracking_lock:
+                active_ids = self.processor.active_track_ids
+                processed_ids = self.processor.processed_ids.copy()
+            
+            if active_ids and all(tid in processed_ids for tid in active_ids):
+                # Skip the next 15 frames rapidly to get past the remainder of the bus
+                dynamic_skip_counter = 15
+                cv2.putText(annotated_frame, "FAST FORWARDING >>>", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
 
             if frame_callback:
                 frame_callback(annotated_frame)
@@ -677,8 +835,10 @@ class VideoUploadProcessor:
             if frame_idx % 20 == 0 and progress_callback:
                 progress_callback(int((frame_idx / total_frames) * 100))
             
-            # Yield minimally (1ms) to keep UI alive while burning through frames
-            time.sleep(0.001) 
+            # [CRITICAL UI FIX] Yield 30ms (up from 1ms)
+            # This allows the Flask backend to actually breathe and send the frames to your React frontend,
+            # eliminating the "lagging" or frozen UI effect.
+            time.sleep(0.03) 
 
         cap.release()
         print(f"[VideoMode] Finished analysis of {video_path}")

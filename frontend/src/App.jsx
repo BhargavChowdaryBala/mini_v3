@@ -292,7 +292,7 @@ function App() {
                             </div>
 
                             <div className="glass-card status-card">
-                                <div className={`status-indicator ${status.includes('Processing') ? 'processing' : ''}`}></div>
+                                <div className={`status-indicator ${status.includes('Processing') || status.includes('ANALYZING') ? 'processing' : ''}`}></div>
                                 <span className="status-text">{status}</span>
                                 <div className="camera-count-badge">
                                     <div className="pulse-dot-small"></div>
@@ -543,7 +543,6 @@ function App() {
                                                             LIVE AI ANALYTICS FEED
                                                         </span>
                                                     ) : 'VIDEO SOURCE PREVIEW'}
-                                                    ```
                                                 </div>
                                             </div>
 
@@ -597,6 +596,7 @@ function App() {
                                                     <th>Bus ID</th>
                                                     <th>Registration</th>
                                                     <th>Status</th>
+                                                    <th>Confidence</th>
                                                     <th>Time</th>
                                                     {appMode === 'upload' && <th>Source</th>}
                                                 </tr>
@@ -624,6 +624,13 @@ function App() {
                                                                     <span className={`status-pill ${log.status}`}>
                                                                         {log.status}
                                                                     </span>
+                                                                </td>
+                                                                <td>
+                                                                    {log.confidence !== undefined && (
+                                                                        <div className={`conf-pill-logs ${log.confidence > 0.8 ? 'high' : log.confidence > 0.5 ? 'med' : 'low'}`}>
+                                                                            {Math.round(log.confidence * 100)}%
+                                                                        </div>
+                                                                    )}
                                                                 </td>
                                                                 <td className="time-text">{log.timestamp}</td>
                                                                 {appMode === 'upload' && <td className="source-tag">{log.source}</td>}

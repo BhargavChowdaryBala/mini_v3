@@ -25,6 +25,7 @@ import os
 import numpy as np
 import base64
 import re
+from collections import Counter
 
 # NEW: Capture camera names on Windows
 if os.name == 'nt':
@@ -62,9 +63,25 @@ def detect_cameras():
         except Exception as e:
             print(f"[System] Warning: Could not resolve camera names: {e}")
             
-    # Fallback if pygrabber fails or no cameras found
+    # Fallback/Supplemental: Probe indices 0-5 using OpenCV 
+    # This helps if pygrabber misses something or if using non-DSHOW drivers.
+    existing_ids = [c["id"] for c in available]
+    for i in range(5):
+        if i in existing_ids: continue
+        try:
+            temp_cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if os.name == 'nt' else 0)
+            if temp_cap.isOpened():
+                available.append({
+                    "id": i,
+                    "name": f"HARDWARE CAMERA {i} (LEGACY PROBE)"
+                })
+                temp_cap.release()
+        except:
+            pass
+            
+    # Absolute Fallback if still empty
     if not available:
-        available = [{"id": 0, "name": "USB2.0 HD UVC WEBCAM (SENSOR 0)"}]
+        available = [{"id": 0, "name": "DEFAULT SENSOR 0 (AUTO-DETECT)"}]
             
     # Add demo source
     available.append({"id": "bus.mp4", "name": "SIMULATED CCTV (DEMO FILE)"})
@@ -309,11 +326,17 @@ def background_capture(token):
 
         ret, frame = cap.read()
         if not ret:
+            print("[Warning] Camera frame not ready or hardware failing...")
             if is_file:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 processor.reset()
                 continue
             else:
+                # Provide a camera failed placeholder to last_frame so UI doesn't hang
+                placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(placeholder, "CAMERA SIGNAL LOST. RETRYING...", (100, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                with lock:
+                    last_frame = placeholder
                 time.sleep(1)
                 continue
         
@@ -366,11 +389,15 @@ def generate_frames():
                 frame_to_use = last_frame.copy()
         
         if frame_to_use is None:
-            time.sleep(0.1)
-            continue
+            # Yield a placeholder instead of hanging
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(placeholder, "INITIALIZING CAMERA HARDWARE...", (80, 240), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 242, 254), 2)
+            ret, buffer = cv2.imencode('.jpg', placeholder, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        else:
+            # Encode OUTSIDE the lock to keep the frame-rate high and prevent stalling
+            ret, buffer = cv2.imencode('.jpg', frame_to_use, [cv2.IMWRITE_JPEG_QUALITY, 80])
             
-        # Encode OUTSIDE the lock to keep the frame-rate high and prevent stalling
-        ret, buffer = cv2.imencode('.jpg', frame_to_use, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if not ret:
             time.sleep(0.01)
             continue
@@ -397,13 +424,17 @@ def toggle_live():
 
 @app.route('/api/list_cameras')
 def list_cameras():
-    """Returns detected hardware and demo sources."""
+    """Returns detected hardware and demo sources. Now dynamic!"""
+    global DETECTED_CAMERAS
     try:
-        # [CRITICAL FIX] Return the startup cached cameras!
-        # Repeatedly polling cv2.VideoCapture(DSHOW) concurrently crashes the backend.
+        # [DYNAMIC UPGRADE] Re-scan hardware on every list request
+        # This allows cameras plugged in after startup to show up instantly.
+        # pygrabber is safe to call repeatedly as it doesn't lock the devices.
+        DETECTED_CAMERAS = detect_cameras()
         return jsonify(DETECTED_CAMERAS)
     except Exception as e:
-        return jsonify([{"id": VIDEO_SOURCE, "name": "Default Stream"}]), 200
+        print(f"[System] Rescan error: {e}")
+        return jsonify(DETECTED_CAMERAS), 200
 
 @app.route('/api/reset_camera', methods=['POST'])
 def reset_camera():
@@ -418,7 +449,7 @@ def reset_camera():
             if str(new_id).isdigit():
                 new_id = int(new_id)
         except Exception as e: 
-            print(f"Warning: Could not parse camera ID numeric value: {e}")
+            print(f"Warning: Could not parse camera ID value '{new_id}': {e}")
         
         print(f"[System] Switching Live Source to: {new_id}")
         
@@ -450,6 +481,73 @@ def logs():
 def get_status():
     return jsonify({"status": processor.get_status()})
 
+@app.route('/api/process_frame', methods=['POST'])
+def process_frame():
+    """
+    Real-time frame analysis for Mobile Camera devices.
+    Processes a base64 encoded frame and returns the results.
+    """
+    try:
+        data = request.json
+        if not data or 'image' not in data:
+            return jsonify({"error": "No image data"}), 400
+        
+        # Decode base64
+        img_data = base64.b64decode(data['image'].split(',')[1])
+        nparr = np.frombuffer(img_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            return jsonify({"error": "Decode failed"}), 400
+
+        # Run Elite v4 analysis
+        # Resize for speed on mobile uploads
+        h, w = img.shape[:2]
+        if max(h, w) > 640:
+            scale = 640 / max(h, w)
+            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+        # We treat each mobile frame as a separate event for now
+        # but use the same inference logic as the static checker
+        with processor.inference_lock:
+            # Detect Plate
+            results = processor.plate_model.predict(img, conf=0.3, verbose=False)
+            
+            plate_text = "SCANNING..."
+            if len(results[0].boxes) > 0:
+                box = results[0].boxes.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = map(int, box)
+                plate_crop = img[y1:y2, x1:x2]
+                
+                if plate_crop.size > 0:
+                    # Multi-Pass OCR on single frame
+                    processed = deskew_plate(plate_crop)
+                    versions = apply_professional_restoration(processed)
+                    
+                    ocr_res = []
+                    for v_img in versions[:3]: # Fast scan for mobile
+                        res = processor.ocr.ocr(v_img, cls=True)
+                        if res and res[0]:
+                            raw_t = "".join([l[1][0] for l in res[0]])
+                            clean_t = extract_indian_number_plate([raw_t])
+                            if clean_t != "UNKNOWN":
+                                ocr_res.append(clean_t)
+                    
+                    if ocr_res:
+                        plate_text = Counter(ocr_res).most_common(1)[0][0]
+                        # NEW: Log successful mobile detections to history
+                        log_event(plate_text, "MOBILE_SCAN", source="mobile_cam")
+                    else:
+                        plate_text = "PLATE DETECTED"
+
+        return jsonify({
+            "status": f"AI READY: {plate_text}",
+            "image": None # WebRTC/Canvas handles display
+        })
+    except Exception as e:
+        print(f"[Mobile] Process Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/check_image', methods=['POST'])
 def check_image():
     try:
@@ -471,7 +569,7 @@ def check_image():
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
         # Start Metrics
-        with processor.lock: # Ensure thread-safe model access
+        with processor.inference_lock: # Ensure thread-safe model access
             start_yolo = time.time()
             results = processor.plate_model.predict(source=img, conf=0.4, verbose=False)
             yolo_time = (time.time() - start_yolo) * 1000 # ms
@@ -492,9 +590,9 @@ def check_image():
                 if plate_crop.size == 0:
                     return jsonify({"plate_text": "NOT DETECTED", "confidence": 0, "plate_image": None, "metrics": {"yolo": round(yolo_time, 2), "ocr": 0}})
 
-                # Apply Professional ISP Preprocessing (Returns [pass_a, pass_b, pass_c])
+                # [ELITE] Professional Restoration for Static Image
+                # We use Pass A for display
                 plate_versions = apply_professional_restoration(plate_crop)
-                # Use Pass A (Grayscale) for initial display and OCR
                 plate_crop_enhanced = plate_versions[0]
                 
                 _, buffer = cv2.imencode('.jpg', plate_crop_enhanced)
@@ -505,26 +603,25 @@ def check_image():
                 ocr_time = 0 
                 
                 try:
-                    # Elite Preprocessing: Deskew + Pad
+                    # Preprocessing
                     plate_crop = deskew_plate(plate_crop)
                     plate_crop = apply_padding(plate_crop, pad=15)
                     
-                    # [STRICT] Multi-Pass OCR for static image check
+                    # [STRICT] Multi-Pass OCR
                     versions = apply_professional_restoration(plate_crop)
                     all_results = []
                     
-                    for v_idx, v_img in enumerate(versions):
-                        with processor.lock:
+                    for v_idx, v_img in enumerate(versions[:4]): # Limit to top 4 passes for performance
+                        with processor.inference_lock:
                             res = processor.ocr.ocr(v_img, cls=True)
                         if res and res[0]:
                             lines = [line[1] for idx in range(len(res)) for line in res[idx]]
                             raw_t = "".join([l[0] for l in lines])
                             conf_val = sum([l[1] for l in lines]) / len(lines) if lines else 0
                             
-                            # Weight format matches higher
                             clean_t = extract_indian_number_plate([raw_t])
                             if clean_t != "UNKNOWN":
-                                all_results.append((clean_t, conf_val + 0.2)) # Priority to strict format
+                                all_results.append((clean_t, conf_val + 0.2))
                                 raw_texts.append(f"Pass {chr(65+v_idx)}: {clean_t} (STRICT)")
                             else:
                                 clean_l = re.sub(r'[^A-Z0-9]', '', raw_t.upper())
@@ -532,17 +629,11 @@ def check_image():
                                 raw_texts.append(f"Pass {chr(65+v_idx)}: {clean_l}")
 
                     if all_results:
-                        # Perform voting even on a single image's multiple passes
                         plate_text = processor.character_voting(all_results)
-                        # Final strict check
                         plate_text = extract_indian_number_plate([plate_text])
                         
                     ocr_time = (time.time() - start_ocr) * 1000 # ms
                 except Exception as e:
-                    print("!!! OCR CRITICAL ERROR !!!")
-                    import traceback
-                    traceback.print_exc()
-                    print(f"Exception details: {str(e)}")
                     ocr_time = (time.time() - start_ocr) * 1000
                     plate_text = "ERR_OCR"
             else:

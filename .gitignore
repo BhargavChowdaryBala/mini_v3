@@ -3,6 +3,9 @@
 venv/
 ENV/
 env/
+bin/
+lib/
+share/
 
 # Python
 __pycache__/
@@ -10,25 +13,44 @@ __pycache__/
 *$py.class
 .env
 .pytest_cache/
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+.history/
 
 # Node.js
 node_modules/
 dist/
 dist-ssr/
 *.local
+.npm
+.eslintcache
 
 # OS Files
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Models (Large files)
+# Models & Data (Large files)
 backend/*.pt
 backend/*.onnx
+backend/runs/
+backend/uploads/
+backend/field_test_logs.csv
+backend/processor.py.bhargav
 
-# Explicitly allow required models
-!backend/best.pt
-!backend/yolov8n.pt
+# Logs & Debug
+*.log
+debug_error.txt
+DSHOW_*.jpg
+
+# Frontend redundant copies & junk
+frontend/node_modules/
+frontend/node_modules - Copy/
+frontend/* - Copy.*
+frontend/package-lock.json
 
 # Local artifacts
 .gemini/
 brain/
+.agents/
