@@ -266,15 +266,16 @@ def background_capture(token):
     
     cap = None
     if isinstance(VIDEO_SOURCE, int) and os.name == 'nt':
-        # [CRITICAL] MJPG + 640x480 is the most stable bandwidth-safe profile for USB 2.0 Webcams
+        # [CRITICAL] 720p (1280x720) is the "Sweet Spot" for 1080p webcams.
+        # It provides 2.2x more pixels than 480p for OCR detail, while maintaining 30 FPS.
         cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_DSHOW)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            print(f"[Live] Hardware camera 0 initialized (MJPG/640x480).")
-            # Clear buffer
-            for _ in range(15): cap.read()
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            print(f"[Live] Hardware camera {VIDEO_SOURCE} initialized at 720p (MJPG/1280x720).")
+            # Clear buffer to get fresh frames
+            for _ in range(5): cap.read()
     else:
         cap = cv2.VideoCapture(VIDEO_SOURCE)
         
@@ -311,11 +312,11 @@ def background_capture(token):
             time.sleep(0.2) # Give hardware time to settle
             try:
                 if isinstance(VIDEO_SOURCE, int) and os.name == 'nt':
-                    print(f"[Debug] Attempting cv2.VideoCapture({VIDEO_SOURCE}, DSHOW)...")
+                    print(f"[Debug] Attempting cv2.VideoCapture({VIDEO_SOURCE}, DSHOW) @ 720p...")
                     cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_DSHOW)
                     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 else:
                     print(f"[Debug] Attempting cv2.VideoCapture({VIDEO_SOURCE})...")
                     cap = cv2.VideoCapture(VIDEO_SOURCE)
